@@ -36,7 +36,7 @@ def log_chat(email, user_message, bot_response):
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO chatbot_logs (email, user_message, bot_response, created_at)
+        INSERT INTO safety_optimise_chatbot_logs (email, user_message, bot_response, created_at)
         VALUES (%s, %s, %s, %s)
         """,
         (email, user_message, bot_response, datetime.now())
@@ -51,7 +51,7 @@ def fetch_chat_history(email, limit=20):
     cursor.execute(
         """
         SELECT user_message, bot_response, created_at
-        FROM chatbot_logs
+        FROM safety_optimise_chatbot_logs
         WHERE email = %s
         ORDER BY created_at DESC
         LIMIT %s
