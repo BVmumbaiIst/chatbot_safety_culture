@@ -1,2 +1,23 @@
+# Core framework
 streamlit
+
+# Database connectivity
+SQLAlchemy
+PyMySQL
+pandas
+
+# OpenAI & LangChain
 openai
+langchain
+langchain-community
+langchain-openai
+
+# AWS SDK
+boto3
+
+# Utilities
+python-dotenv
+tqdm
+
+# Optional but useful
+tenacity
