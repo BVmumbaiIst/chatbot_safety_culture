@@ -1,56 +1,108 @@
 import streamlit as st
-from openai import OpenAI
+import pandas as pd
+from sqlalchemy import create_engine, text
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_sql_agent
+from langchain.agents.agent_toolkits import SQLDatabaseToolkit
+from langchain.sql_database import SQLDatabase
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# ----------------------------------------
+# ⚙️ App Config
+# ----------------------------------------
+st.set_page_config(page_title="🦺 Safety Optimise Chatbot", layout="wide")
+st.title("🦺 Safety Optimise Chatbot")
+st.write("Chat securely with your inspection data using your company email access.")
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# ----------------------------------------
+# 🔐 Load Secrets from Streamlit
+# ----------------------------------------
+openai_api_key = st.secrets["OPENAI_API_KEY"]
+db_config = st.secrets["mysql"]
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# Build MySQL connection string
+DB_URI = f"mysql+pymysql://{db_config['user']}:{db_config['password']}@{db_config['host']}/{db_config['database']}"
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
+# Create SQLAlchemy engine
+engine = create_engine(DB_URI)
+
+# LangChain Database Wrapper
+db = SQLDatabase(engine=engine)
+
+# Initialize OpenAI Model (via LangChain)
+llm = ChatOpenAI(openai_api_key=openai_api_key, model="gpt-4-turbo", temperature=0)
+toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+agent_executor = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True)
+
+# ----------------------------------------
+# 🧠 Helper Functions
+# ----------------------------------------
+@st.cache_data(ttl=600)
+def run_query(query: str):
+    with engine.connect() as conn:
+        return pd.read_sql(text(query), conn)
+
+def verify_user(email: str) -> bool:
+    query = f"SELECT email FROM inspection_employee_schedule WHERE email = '{email}' LIMIT 1;"
+    df = run_query(query)
+    return not df.empty
+
+# ----------------------------------------
+# 🔑 Email Authentication
+# ----------------------------------------
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    email_input = st.text_input("📧 Enter your company email to access the chatbot")
+
+    if st.button("Verify Email"):
+        if email_input:
+            if verify_user(email_input):
+                st.session_state.authenticated = True
+                st.session_state.user_email = email_input
+                st.success(f"✅ Access granted. Welcome, {email_input}!")
+            else:
+                st.error("🚫 Email not found in access list.")
+        else:
+            st.warning("Please enter a valid email address to proceed.")
+
+# ----------------------------------------
+# 💬 Chatbot Section
+# ----------------------------------------
+if st.session_state.authenticated:
+    st.divider()
+    st.subheader("🤖 Chat with your inspection database")
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Display previous messages
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
-
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # Chat input
+    if user_prompt := st.chat_input("Ask me about inspections, employees, or schedules..."):
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(user_prompt)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+        st.session_state.messages.append({"role": "user", "content": user_prompt})
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        # Generate SQL answer
+        try:
+            with st.chat_message("assistant"):
+                with st.spinner("🔍 Thinking..."):
+                    result = agent_executor.run(user_prompt)
+
+                    if isinstance(result, pd.DataFrame):
+                        st.dataframe(result)
+                        response_text = f"Returned {len(result)} rows."
+                    else:
+                        response_text = result
+
+                    st.markdown(response_text)
+
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+        except Exception as e:
+            st.error(f"⚠️ Error: {e}")
