@@ -21,7 +21,7 @@ def get_db_connection():
 
 def verify_user(email):
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(buffered=True)  # ✅ ensures all results are read
     cursor.execute(
         "SELECT email FROM inspection_employee_schedule WHERE email = %s",
         (email,)
@@ -36,7 +36,7 @@ def log_chat(email, user_message, bot_response):
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO safety_optimise_chatbot_logs (email, user_message, bot_response, created_at)
+        INSERT INTO chatbot_logs (email, user_message, bot_response, created_at)
         VALUES (%s, %s, %s, %s)
         """,
         (email, user_message, bot_response, datetime.now())
@@ -47,11 +47,11 @@ def log_chat(email, user_message, bot_response):
 
 def fetch_chat_history(email, limit=20):
     conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor(dictionary=True, buffered=True)
     cursor.execute(
         """
         SELECT user_message, bot_response, created_at
-        FROM safety_optimise_chatbot_logs
+        FROM chatbot_logs
         WHERE email = %s
         ORDER BY created_at DESC
         LIMIT %s
@@ -62,6 +62,7 @@ def fetch_chat_history(email, limit=20):
     cursor.close()
     conn.close()
     return rows
+
 
 # ---- Streamlit UI ----
 st.title("💬 Safety Optimise Chatbot")
