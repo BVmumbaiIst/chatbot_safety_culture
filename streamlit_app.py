@@ -132,3 +132,32 @@ else:
             log_chat(st.session_state.email, prompt, response)
         except Exception as e:
             st.warning(f"⚠️ Could not log chat: {e}")
+
+ # Step 2: Chatbot Interface
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask your safety-related question:"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Get OpenAI response
+        stream = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages
+            ],
+            stream=True,
+        )
+
+        with st.chat_message("assistant"):
+            response = st.write_stream(stream)
+        st.session_state.messages.append({"role": "assistant", "content": response})
