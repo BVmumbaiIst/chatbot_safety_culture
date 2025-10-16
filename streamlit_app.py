@@ -1,108 +1,133 @@
 import streamlit as st
-import pandas as pd
-from sqlalchemy import create_engine, text
-from langchain_openai import ChatOpenAI
-from langchain.agents import create_sql_agent
-from langchain.agents.agent_toolkits import SQLDatabaseToolkit
-from langchain.sql_database import SQLDatabase
+import mysql.connector
+from openai import OpenAI
+from datetime import datetime
 
-# ----------------------------------------
-# ⚙️ App Config
-# ----------------------------------------
-st.set_page_config(page_title="🦺 Safety Optimise Chatbot", layout="wide")
-st.title("🦺 Safety Optimise Chatbot")
-st.write("Chat securely with your inspection data using your company email access.")
+# ---- Securely load secrets ----
+DB_HOST = st.secrets["DB_HOST"]
+DB_USER = st.secrets["DB_USER"]
+DB_PASSWORD = st.secrets["DB_PASSWORD"]
+DB_NAME = st.secrets["DB_NAME"]
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
-# ----------------------------------------
-# 🔐 Load Secrets from Streamlit
-# ----------------------------------------
-openai_api_key = st.secrets["OPENAI_API_KEY"]
-db_config = st.secrets["mysql"]
+# ---- MySQL connection ----
+def get_db_connection():
+    return mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME
+    )
 
-# Build MySQL connection string
-DB_URI = f"mysql+pymysql://{db_config['user']}:{db_config['password']}@{db_config['host']}/{db_config['database']}"
+def verify_user(email):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT email FROM inspection_employee_schedule WHERE email = %s",
+        (email,)
+    )
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return result is not None
 
-# Create SQLAlchemy engine
-engine = create_engine(DB_URI)
+def log_chat(email, user_message, bot_response):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO chatbot_logs (email, user_message, bot_response, created_at)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (email, user_message, bot_response, datetime.now())
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-# LangChain Database Wrapper
-db = SQLDatabase(engine=engine)
+def fetch_chat_history(email, limit=20):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        """
+        SELECT user_message, bot_response, created_at
+        FROM chatbot_logs
+        WHERE email = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (email, limit)
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows
 
-# Initialize OpenAI Model (via LangChain)
-llm = ChatOpenAI(openai_api_key=openai_api_key, model="gpt-4-turbo", temperature=0)
-toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-agent_executor = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True)
+# ---- Streamlit UI ----
+st.title("💬 Safety Optimise Chatbot")
 
-# ----------------------------------------
-# 🧠 Helper Functions
-# ----------------------------------------
-@st.cache_data(ttl=600)
-def run_query(query: str):
-    with engine.connect() as conn:
-        return pd.read_sql(text(query), conn)
-
-def verify_user(email: str) -> bool:
-    query = f"SELECT email FROM inspection_employee_schedule WHERE email = '{email}' LIMIT 1;"
-    df = run_query(query)
-    return not df.empty
-
-# ----------------------------------------
-# 🔑 Email Authentication
-# ----------------------------------------
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    email_input = st.text_input("📧 Enter your company email to access the chatbot")
+if "verified" not in st.session_state:
+    email = st.text_input("Enter your registered email to access the chatbot:")
 
     if st.button("Verify Email"):
-        if email_input:
-            if verify_user(email_input):
-                st.session_state.authenticated = True
-                st.session_state.user_email = email_input
-                st.success(f"✅ Access granted. Welcome, {email_input}!")
-            else:
-                st.error("🚫 Email not found in access list.")
+        if verify_user(email):
+            st.session_state.verified = True
+            st.session_state.email = email
+            st.success("✅ Access granted! Welcome.")
         else:
-            st.warning("Please enter a valid email address to proceed.")
+            st.error("🚫 Access denied. Email not found in records.")
 
-# ----------------------------------------
-# 💬 Chatbot Section
-# ----------------------------------------
-if st.session_state.authenticated:
-    st.divider()
-    st.subheader("🤖 Chat with your inspection database")
+else:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Sidebar chat history viewer
+    st.sidebar.header("🗂️ Chat History")
+    with st.sidebar:
+        if st.button("🔄 Refresh History"):
+            st.session_state.history = fetch_chat_history(st.session_state.email)
+
+        if "history" not in st.session_state:
+            st.session_state.history = fetch_chat_history(st.session_state.email)
+
+        if len(st.session_state.history) == 0:
+            st.sidebar.write("No chat history yet.")
+        else:
+            for chat in st.session_state.history:
+                st.markdown(f"**🕒 {chat['created_at'].strftime('%Y-%m-%d %H:%M:%S')}**")
+                st.markdown(f"**You:** {chat['user_message']}")
+                st.markdown(f"**Bot:** {chat['bot_response']}")
+                st.markdown("---")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display previous messages
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # Display chat
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    # Chat input
-    if user_prompt := st.chat_input("Ask me about inspections, employees, or schedules..."):
+    if prompt := st.chat_input("Ask your safety-related question:"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.markdown(user_prompt)
+            st.markdown(prompt)
 
-        st.session_state.messages.append({"role": "user", "content": user_prompt})
+        # Generate OpenAI response
+        stream = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages
+            ],
+            stream=True,
+        )
 
-        # Generate SQL answer
+        with st.chat_message("assistant"):
+            response = st.write_stream(stream)
+
+        st.session_state.messages.append({"role": "assistant", "content": response})
+
+        # Log chat to MySQL
         try:
-            with st.chat_message("assistant"):
-                with st.spinner("🔍 Thinking..."):
-                    result = agent_executor.run(user_prompt)
-
-                    if isinstance(result, pd.DataFrame):
-                        st.dataframe(result)
-                        response_text = f"Returned {len(result)} rows."
-                    else:
-                        response_text = result
-
-                    st.markdown(response_text)
-
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
-
+            log_chat(st.session_state.email, prompt, response)
         except Exception as e:
-            st.error(f"⚠️ Error: {e}")
+            st.warning(f"⚠️ Could not log chat: {e}")
