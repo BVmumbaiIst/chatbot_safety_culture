@@ -5,6 +5,7 @@ streamlit
 SQLAlchemy
 PyMySQL
 pandas
+mysql-connector-python
 
 # OpenAI & LangChain
 openai
