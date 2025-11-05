@@ -1,170 +1,524 @@
+import os
+import sqlite3
+import pandas as pd
 import streamlit as st
-import mysql.connector
-from openai import OpenAI
+
+
+import numpy as np
+import traceback
 from datetime import datetime
+from dotenv import load_dotenv
+from pandasql import sqldf
+from tabulate import tabulate
+import language_tool_python  # for grammar check
 
-# -----------------------
-# Load secrets from Streamlit
-# -----------------------
-DB_HOST = st.secrets["DB_HOST"]
-DB_USER = st.secrets["DB_USER"]
-DB_PASSWORD = st.secrets["DB_PASSWORD"]
-DB_NAME = st.secrets["DB_NAME"]
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+# --- LangChain imports ---
+from langchain_community.chat_models import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import LLMChain, RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_community.agent_toolkits import create_sql_agent
+from langchain_community.utilities import SQLDatabase
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 
-# -----------------------
-# Database connection
-# -----------------------
-def get_db_connection():
-    return mysql.connector.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME
+# --- Visualization ---
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+
+# --- Database ---
+from sqlalchemy import create_engine
+from openai import OpenAI
+
+# --- AWS + Utilities ---
+import boto3
+import tempfile
+from io import BytesIO
+
+# ------------------------
+# Load environment variables
+# ------------------------
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ------------------------
+# AWS S3 setup
+# ------------------------
+s3 = boto3.client("s3")
+BUCKET_NAME = "iauditorsafetydata"
+S3_KEYS = {
+    "items": "BVPI_Safety_Optimise/safety_Chat_bot_db/inspection_employee_schedule_items.db",
+    "users": "BVPI_Safety_Optimise/safety_Chat_bot_db/inspection_employee_schedule.db"
+}
+
+def download_db_from_s3(s3_key):
+    # Create a truly unique temp file
+    tmp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    local_path = tmp_file.name
+    tmp_file.close()  # close it so Windows releases the lock
+    s3.download_file(BUCKET_NAME, s3_key, local_path)
+    return local_path
+
+# def download_db_from_s3(s3_key):
+#     """Download S3 DB file into local project directory (not /tmp)."""
+#     local_dir = os.path.join(os.getcwd(), "downloaded_dbs")
+#     os.makedirs(local_dir, exist_ok=True)
+
+#     filename = os.path.basename(s3_key)
+#     local_path = os.path.join(local_dir, filename)
+
+#     # Skip download if already exists to avoid re-downloading large files
+#     if not os.path.exists(local_path):
+#         st.info(f"Downloading {filename} from S3...")
+#         s3.download_file(BUCKET_NAME, s3_key, local_path)
+#         st.success(f"✅ Downloaded {filename} successfully.")
+#     else:
+#         st.info(f"Using cached copy of {filename}")
+
+#     return local_path
+
+
+# Download
+DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
+DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
+
+# ------------------------
+# Database connections
+# ------------------------
+@st.cache_resource
+def get_connection_items():
+    return sqlite3.connect(DB_PATH_ITEMS, check_same_thread=False)
+
+@st.cache_resource
+def get_connection_users():
+    return sqlite3.connect(DB_PATH_USERS, check_same_thread=False)
+
+
+# ------------------------
+# Get Filter Options
+# ------------------------
+def get_filter_options_items(conn_items):
+    df = pd.read_sql("SELECT * FROM inspection_employee_schedule_items", conn_items)
+    df["date completed"] = pd.to_datetime(df["date completed"], errors="coerce")
+    return {
+        "date_min": df["date completed"].min(),
+        "date_max": df["date completed"].max(),
+        "regions": sorted(df["region"].dropna().unique().tolist()),
+        "templates": sorted(df["TemplateNames"].dropna().unique().tolist()),
+        "employees": sorted(df["owner name"].dropna().unique().tolist()),
+        "statuses": sorted(df["assignee status"].dropna().unique().tolist()),
+        "employeestatus": sorted(df["employee status"].dropna().unique().tolist())
+    }
+
+
+def get_valid_emails(conn_users):
+    df_user = pd.read_sql("SELECT * FROM inspection_employee_schedule", conn_users)
+    return sorted(df_user["email"].dropna().unique().tolist())
+
+
+# ------------------------
+# LLM Setup
+# ------------------------
+@st.cache_resource
+def setup_llm_memory():
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        openai_api_key=OPENAI_API_KEY
     )
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    return llm, memory
 
-# -----------------------
-# User verification
-# -----------------------
-def verify_user(email):
-    conn = get_db_connection()
-    cursor = conn.cursor(buffered=True)
-    cursor.execute(
-        "SELECT email FROM inspection_employee_schedule WHERE email = %s",
-        (email,)
-    )
-    result = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return result is not None
 
-# -----------------------
-# Fetch user-specific items for context
-# -----------------------
-def fetch_items_by_email(email):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(
-        "SELECT * FROM inspection_employee_schedule_items WHERE email = %s",
-        (email,)
-    )
-    items = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return items
+llm, memory = setup_llm_memory()
 
-# -----------------------
-# Chat logging
-# -----------------------
-def log_chat(email, user_message, bot_response):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO chatbot_logs (email, user_message, bot_response, created_at)
-        VALUES (%s, %s, %s, %s)
-        """,
-        (email, user_message, bot_response, datetime.now())
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+# ------------------------
+# Streamlit Config
+# ------------------------
+st.set_page_config(page_title="Interactive Data Chatbot", layout="wide")
+st.title("💬 Interactive Data Chatbot + Analytics")
 
-# -----------------------
-# Fetch chat history
-# -----------------------
-def fetch_chat_history(email, limit=20):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True, buffered=True)
-    cursor.execute(
-        """
-        SELECT user_message, bot_response, created_at
-        FROM chatbot_logs
-        WHERE email = %s
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        (email, limit)
-    )
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return rows
+conn_items = get_connection_items()
+conn_users = get_connection_users()
+filters_items = get_filter_options_items(conn_items)
+valid_emails = get_valid_emails(conn_users)
 
-# -----------------------
-# Streamlit UI
-# -----------------------
-st.title("💬 Safety Optimise Chatbot")
-
-if "verified" not in st.session_state:
-    email = st.text_input("Enter your registered email to access the chatbot:")
-    if st.button("Verify Email"):
-        if verify_user(email):
-            st.session_state.verified = True
-            st.session_state.email = email
-            st.success("✅ Access granted!")
-            # Preload user items and chat history
-            st.session_state.items = fetch_items_by_email(email)
-            st.session_state.history = fetch_chat_history(email)
-            st.session_state.messages = []
+# ------------------------
+# Sidebar Login
+# ------------------------
+with st.sidebar:
+    st.header("🔑 Login")
+    entered_email = st.text_input("Enter your Email")
+    if st.button("Login"):
+        if entered_email:
+            if entered_email in valid_emails:
+                st.session_state["logged_in"] = True
+                st.session_state["email"] = entered_email
+                st.success(f"✅ Logged in as: {entered_email}")
+            else:
+                st.session_state["logged_in"] = False
+                st.error("❌ Access denied. Email not found.")
         else:
-            st.error("🚫 Access denied. Email not found.")
+            st.warning("Please enter an email.")
 
-else:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+if not st.session_state.get("logged_in", False):
+    st.warning("🔒 Please log in to access filters and data.")
+    st.stop()
 
-    # Sidebar: chat history
-    st.sidebar.header("🗂️ Chat History")
-    if st.sidebar.button("🔄 Refresh History"):
-        st.session_state.history = fetch_chat_history(st.session_state.email)
+# ------------------------
+# Sidebar Filters
+# ------------------------
+st.sidebar.header("🔎 Apply Filters")
+date_range = st.sidebar.date_input(
+    "Select Date Range",
+    [filters_items["date_min"], filters_items["date_max"]],
+    min_value=filters_items["date_min"],
+    max_value=filters_items["date_max"]
+)
+region = st.sidebar.multiselect("Select Regions", filters_items["regions"])
+template = st.sidebar.multiselect("Select Template", filters_items["templates"])
+employee = st.sidebar.multiselect("Select Employee (Owner Name)", filters_items["employees"])
+status = st.sidebar.multiselect("Select Assignee Status", filters_items["statuses"])
+employee_status = st.sidebar.multiselect("Select Employee Status", filters_items["employeestatus"])
+row_limit = st.sidebar.slider("Limit number of rows:", min_value=10, max_value=5000, value=200, step=10)
 
-    if len(st.session_state.history) == 0:
-        st.sidebar.write("No chat history yet.")
+# ------------------------
+# Dynamic SQL Query Builder
+# ------------------------
+sql_filters = []
+
+if date_range:
+    start_date = pd.to_datetime(date_range[0]).strftime("%Y-%m-%d")
+    end_date = pd.to_datetime(date_range[1]).strftime("%Y-%m-%d")
+    sql_filters.append(f'"date completed" BETWEEN "{start_date}" AND "{end_date}"')
+
+if region:
+    sql_filters.append(f'region IN ({",".join([f"\'{r}\'" for r in region])})')
+if template:
+    sql_filters.append(f'"TemplateNames" IN ({",".join([f"\'{t}\'" for t in template])})')
+if employee:
+    sql_filters.append(f'"owner name" IN ({",".join([f"\'{e}\'" for e in employee])})')
+if status:
+    sql_filters.append(f'"assignee status" IN ({",".join([f"\'{s}\'" for s in status])})')
+if employee_status:
+    sql_filters.append(f'"employee status" IN ({",".join([f"\'{es}\'" for es in employee_status])})')
+
+where_clause = " AND ".join(sql_filters) if sql_filters else "1=1"
+default_query = f'SELECT * FROM inspection_employee_schedule_items WHERE {where_clause} LIMIT {row_limit};'
+sql_query = st.sidebar.text_area("✏️ Edit SQL Query", value=default_query, height=120)
+st.sidebar.code(sql_query, language="sql")
+
+if st.sidebar.button("Run Query"):
+    try:
+        df = pd.read_sql(sql_query, conn_items)
+        st.session_state["filtered_df"] = df
+        st.success(f"Loaded {len(df)} rows.")
+        st.dataframe(df)
+    except Exception as e:
+        st.error(f"❌ SQL Error: {e}")
+
+# ------------------------
+# Setup Agents
+# ------------------------
+@st.cache_resource
+def setup_sql_agent():
+    db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH_ITEMS}")
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+    return create_sql_agent(llm=llm, db=db, agent_type="openai-tools", verbose=True)
+
+
+@st.cache_resource
+def setup_vector_rag():
+    """Setup FAISS retriever once and reuse."""
+    engine = create_engine(f"sqlite:///{DB_PATH_ITEMS}")
+    df = pd.read_sql("SELECT * FROM inspection_employee_schedule_items LIMIT 20000", engine)
+
+    docs = [Document(page_content=row.to_json(), metadata={"row": i}) for i, row in df.iterrows()]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+
+    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
+
+
+sql_agent = setup_sql_agent()
+rag_chain = setup_vector_rag()
+
+# ------------------------
+# Only generate visuals / summaries if df exists
+# ------------------------
+if "filtered_df" in st.session_state:
+    df = st.session_state["filtered_df"]
+
+
+# ------------------------
+# Chatbot Logic
+# ------------------------
+def get_chatbot_response(user_query):
+    sql_keywords = [
+        "average", "sum", "top", "count", "max", "min", "group by", "trend",
+        "between", "total", "where", "order by", "compare", "ratio"
+    ]
+    if any(k in user_query.lower() for k in sql_keywords):
+        response = sql_agent.invoke({"input": user_query})
+        return response.get("output", "⚠️ No SQL result found.")
     else:
-        for chat in st.session_state.history:
-            st.sidebar.markdown(f"**🕒 {chat['created_at'].strftime('%Y-%m-%d %H:%M:%S')}**")
-            st.sidebar.markdown(f"**You:** {chat['user_message']}")
-            st.sidebar.markdown(f"**Bot:** {chat['bot_response']}")
-            st.sidebar.markdown("---")
+        return rag_chain.run(user_query)
 
-    # Display current chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# ------------------------
+# Chatbot Logic Filterd_df
+# ------------------------
+def summarize_filtered_df(df):
+    sql_keywords = [
+        "average", "sum", "top", "count", "max", "min", "group by", "trend",
+        "between", "total", "where", "order by", "compare", "ratio"
+    ]
+    if any(k in df.lower() for k in sql_keywords):
+        response = sql_agent.invoke({"input": df})
+        return response.get("output", "⚠️ No SQL result found.")
+    else:
+        return rag_chain.run(df)
 
-    # Chat input
-    if prompt := st.chat_input("Ask your safety-related question:"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+def generate_report_with_insights(summary, question):
+    """
+    Generate a professional report with actionable insights using LLM.
+    """
+    prompt = f"""
+    You are a senior data analyst. You are provided with summary statistics of inspection data.
+    Also, there are visualizations for inspections per region, template, and employee (shown in Streamlit).
+    Use the summary and visualizations to:
+      1. Answer the user's question clearly.
+      2. Highlight key patterns and anomalies.
+      3. show the KPI for templates count.
+      4. Identify top/bottom performing regions, templates, assignee status, reponses or employees.
+      5. Provide actionable recommendations.
 
-        # Prepare context from user items
-        context_text = "\n".join(
-            [f"{item['task']}: {item['description']}" for item in st.session_state.items]
+    Summary data:
+    {summary}
+
+    Question: {question}
+
+    Return the answer as a professional report in clear English with proper grammar.
+    """
+    return llm.predict(prompt)
+
+# ------------------------
+# Layout
+# ------------------------
+col_left, col_right = st.columns([1, 0.6])
+
+# LEFT: Chatbot
+
+with col_left:
+    st.subheader("💬 Ask a Question About the Data")
+    user_question = st.text_input("Enter your question:")
+
+    if st.button("Ask ChatGPT"):
+        if not user_question.strip():
+            st.warning("Please enter a question.")
+        else:
+            try:
+                # ✅ CASE 1: Use filtered dataframe if available
+                if "filtered_df" in st.session_state and not st.session_state["filtered_df"].empty:
+                    df = st.session_state["filtered_df"]
+                    summary = summarize_filtered_df(df)
+                    answer = generate_report_with_insights(summary,user_question)
+                    st.markdown("### 📋 Chatbot Response")
+                    st.write(answer)
+                
+                # ✅ CASE 2: Otherwise → use SQL Agent on full DB
+                else:
+                   
+                    final_answer=get_chatbot_response(user_question)
+                    st.markdown("### 📋 Chatbot Response")
+                    st.write(final_answer)
+
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+
+# ------------------------
+# Right: Visual on Right columns
+# ------------------------
+
+def apply_chart_theme(fig):
+    """Apply a consistent transparent visual theme."""
+    fig.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#FFFFFF", size=12),
+        title_x=0.05,
+        title_font=dict(size=18),
+        showlegend=True,
+        margin=dict(l=30, r=30, t=60, b=40)
+    )
+    return fig
+
+
+def chart_header(title, key):
+    """Render chart header with title (left) and small dropdown (right)."""
+    col1, col2 = st.columns([5, 1])
+
+    with col1:
+        st.markdown(f"### {title}")
+
+    with col2:
+        chart_type = st.selectbox(
+            "Chart Type",
+            ["Bar Chart", "Pie Chart"],
+            key=key,
+            label_visibility="collapsed",
+            index=0
         )
-        full_prompt = f"""
-You are a safety assistant. Use the following tasks data to answer the question.
 
-Tasks:
-{context_text}
+    return chart_type
 
-User question: {prompt}
-"""
 
-        # Generate OpenAI response
-        stream = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": full_prompt}],
-            stream=True,
-        )
+def generate_visuals(df):
+    """Generate aggregated visualizations for filtered dataframe."""
+    visuals = {}
+    vivid_colors = px.colors.qualitative.Vivid
+    bold_colors = px.colors.qualitative.Bold
 
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
+    # 🌐 Inspections per Region
+    if {"region", "TemplateNames"}.issubset(df.columns):
+        region_count = df.groupby("region")["TemplateNames"].count().reset_index(name="count")
+        chart_type = chart_header("🌐 Inspections per Region", "region_chart_type")
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        if chart_type == "Bar Chart":
+            fig = px.bar(
+                region_count, x="region", y="count", text="count",
+                color="region", color_discrete_sequence=vivid_colors
+            )
+        else:
+            fig = px.pie(
+                region_count, names="region", values="count",
+                color_discrete_sequence=vivid_colors
+            )
 
-        # Log chat to MySQL
-        try:
-            log_chat(st.session_state.email, prompt, response)
-        except Exception as e:
-            st.warning(f"⚠️ Could not log chat: {e}")
+        visuals["inspections_per_region"] = apply_chart_theme(fig)
+        st.plotly_chart(fig, use_container_width=True,key="region_chart")
+
+    # 📋 Inspections per Template
+    if {"TemplateNames", "owner name"}.issubset(df.columns):
+        template_count = df.groupby("TemplateNames")["owner name"].count().reset_index(name="count")
+        chart_type = chart_header("📋 Inspections per Template", "template_chart_type")
+
+        if chart_type == "Bar Chart":
+            fig = px.bar(
+                template_count, x="TemplateNames", y="count", text="count",
+                color="TemplateNames", color_discrete_sequence=bold_colors
+            )
+        else:
+            fig = px.pie(
+                template_count, names="TemplateNames", values="count",
+                color_discrete_sequence=bold_colors
+            )
+
+        visuals["inspections_per_template"] = apply_chart_theme(fig)
+        st.plotly_chart(fig, use_container_width=True,key="template_chart")
+
+    # 🧑‍💼 Inspections per Employee
+    if "owner name" in df.columns:
+        emp_count = df["owner name"].value_counts().reset_index()
+        emp_count.columns = ["owner name", "count"]
+        chart_type = chart_header("🧑‍💼 Inspections per Employee", "employee_chart_type")
+
+        if chart_type == "Bar Chart":
+            fig = px.bar(
+                emp_count, x="owner name", y="count", text="count",
+                color="owner name", color_discrete_sequence=vivid_colors
+            )
+        else:
+            fig = px.pie(
+                emp_count, names="owner name", values="count",
+                color_discrete_sequence=vivid_colors
+            )
+
+        visuals["inspections_per_employee"] = apply_chart_theme(fig)
+        st.plotly_chart(fig, use_container_width=True,key="employee_chart")
+
+    # ✅🚫⏳ Inspections per Assignee Status
+    if "assignee status" in df.columns:
+        status_count = df["assignee status"].value_counts().reset_index()
+        status_count.columns = ["assignee status", "count"]
+        chart_type = chart_header("✅🚫⏳ Inspections per Assignee Status", "assignee_chart_type")
+
+        if chart_type == "Bar Chart":
+            fig = px.bar(
+                status_count, x="assignee status", y="count", text="count",
+                color="assignee status", color_discrete_sequence=vivid_colors
+            )
+        else:
+            fig = px.pie(
+                status_count, names="assignee status", values="count",
+                color_discrete_sequence=vivid_colors
+            )
+
+        visuals["status_counts"] = apply_chart_theme(fig)
+        st.plotly_chart(fig, use_container_width=True, key="assignee_chart")
+
+    # 🏷️ Inspections per Response
+    if "response" in df.columns:
+        resp_count = df["response"].value_counts().reset_index()
+        resp_count.columns = ["response", "count"]
+        chart_type = chart_header("🏷️ Inspections per Response", "response_chart_type")
+
+        if chart_type == "Bar Chart":
+            fig = px.bar(
+                resp_count, x="response", y="count", text="count",
+                color="response", color_discrete_sequence=vivid_colors
+            )
+        else:
+            fig = px.pie(
+                resp_count, names="response", values="count",
+                color_discrete_sequence=vivid_colors
+            )
+
+        visuals["response_counts"] = apply_chart_theme(fig)
+        st.plotly_chart(fig, use_container_width=True,key="response_chart")
+
+    return visuals
+
+
+
+# RIGHT: Data Visualizations
+with col_right:
+    st.subheader("📊 Filtered Data & Visualizations")
+
+    # Check if a filtered dataframe exists
+    if "filtered_df" in st.session_state and not st.session_state["filtered_df"].empty:
+        df = st.session_state["filtered_df"]
+
+        st.markdown("### 🔍 Filtered Data Table")
+        st.dataframe(df, use_container_width=True)
+
+        # ✅ Completion by month chart
+        if "date completed" in df.columns and "TemplateNames" in df.columns:
+            df = df.assign(
+                completion_month=pd.to_datetime(df["date completed"], errors="coerce").dt.to_period("M").astype(str)
+            )
+            chart_df = (
+                df.groupby("completion_month")["TemplateNames"]
+                .count()
+                .reset_index(name="template_count")
+                .sort_values("completion_month")  # ensures chronological order
+            )
+
+            st.markdown("### 📅 Inspections by Completion Month")
+            st.bar_chart(chart_df.set_index("completion_month")["template_count"])
+
+        # ✅ Additional visuals
+        visuals = generate_visuals(df)
+
+    else:
+        st.info("ℹ️ No data loaded yet. Please apply filters and click 'Run Query' first.")
+
