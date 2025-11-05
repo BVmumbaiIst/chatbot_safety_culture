@@ -185,15 +185,21 @@ if date_range:
 
 # Other filters
 if region:
-    sql_filters.append(f'region IN ({",".join([f"\"{r}\'" for r in region])})')
+    region_list = ", ".join([f"'{r}'" for r in region])
+    sql_filters.append(f"region IN ({region_list})")
 if template:
-    sql_filters.append(f'"TemplateNames" IN ({",".join([f"\"{t}\'" for t in template])})')
+    template_list = ", ".join([f"'{t}'" for t in template])
+    sql_filters.append(f'"TemplateNames" IN ({template_list})')
 if employee:
-    sql_filters.append(f'"owner name" IN ({",".join([f"\"{e}\'" for e in employee])})')
+    employee_list = ", ".join([f"'{e}'" for e in employee])
+    sql_filters.append(f'"owner name" IN ({employee_list})')
 if status:
-    sql_filters.append(f'"assignee status" IN ({",".join([f"\"{s}\'" for s in status])})')
+    status_list = ", ".join([f"'{s}'" for s in status])
+    sql_filters.append(f'"assignee status" IN ({status_list})')
 if employee_status:
-    sql_filters.append(f'"employee status" IN ({",".join([f"\"{es}\'" for es in employee_status])})')
+    employee_status_list = ", ".join([f"'{es}'" for es in employee_status])
+    sql_filters.append(f'"employee status" IN ({employee_status_list})')
+
 
 where_clause = " AND ".join(sql_filters) if sql_filters else "1=1"
 default_query = f'SELECT * FROM inspection_employee_schedule_items WHERE {where_clause} LIMIT {row_limit};'
