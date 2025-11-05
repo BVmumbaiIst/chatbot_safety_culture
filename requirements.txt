@@ -64,8 +64,7 @@ language-tool-python
 pydantic
 pydantic[email]
 
-# SQLite
-sqlite3
+
 
 
 
