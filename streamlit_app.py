@@ -15,7 +15,7 @@ import language_tool_python  # for grammar check
 
 # --- LangChain imports ---
 from langchain_community.chat_models import ChatOpenAI
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate  # <-- updated path
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities import SQLDatabase
 from langchain_community.vectorstores import FAISS
