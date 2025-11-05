@@ -15,7 +15,9 @@ import language_tool_python  # for grammar check
 
 # --- LangChain imports ---
 from langchain_openai import ChatOpenAI
-from langchain.chains.retrieval_qa.base import RetrievalQA
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities import SQLDatabase
@@ -220,21 +222,39 @@ def setup_sql_agent():
 
 @st.cache_resource
 def setup_vector_rag():
-    """Setup FAISS retriever once and reuse."""
+    """Setup FAISS retriever (modern LangChain v0.3 style)."""
     engine = create_engine(f"sqlite:///{DB_PATH_ITEMS}")
     df = pd.read_sql("SELECT * FROM inspection_employee_schedule_items LIMIT 20000", engine)
 
+    # Convert rows to Document format
     docs = [Document(page_content=row.to_json(), metadata={"row": i}) for i, row in df.iterrows()]
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
 
+    # Create embeddings + FAISS retriever
     embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     vectorstore = FAISS.from_documents(chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
-    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
+    # Define a simple retrieval-based prompt
+    prompt = ChatPromptTemplate.from_template("""
+    You are a helpful data assistant analyzing safety inspection data.
+    Use the context below to answer the user's question.
 
+    Context:
+    {context}
+
+    Question: {input}
+    """)
+
+    # Initialize LLM
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+
+    # Build modern retrieval chain
+    document_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, document_chain)
+
+    return rag_chain
 
 sql_agent = setup_sql_agent()
 rag_chain = setup_vector_rag()
@@ -298,11 +318,14 @@ def detect_query_relevance(llm, df, user_query):
         * If the question asks about columns, metrics, or values visible in this dataset → it's RELATED.
         * If it asks about something outside the dataset (e.g., different region, global summary, templates not in this subset) → it's UNRELATED.
 
-    Answer ONLY with:
-    "RELATED" or "UNRELATED"
+    Answer ONLY with: 
+    "RELATED" or "UNRELATED".
     """
+
+    
     result = llm.predict(prompt).strip().upper()
     return "RELATED" in result
+
 
 
 # ------------------------
@@ -351,8 +374,9 @@ def get_chatbot_response(user_query, sql_agent, rag_chain):
         response = sql_agent.invoke({"input": user_query})
         return response.get("output", "⚠️ No SQL result found.")
     else:
-        return rag_chain.run(user_query)
-
+        # ✅ Use modern invoke()
+        result = rag_chain.invoke({"input": user_query})
+        return result["answer"] if "answer" in result else str(result)
 
 # ------------------------
 # Visual Generator
