@@ -2,7 +2,8 @@ import os
 import sqlite3
 import pandas as pd
 import streamlit as st
-
+import json
+import re
 
 import numpy as np
 import traceback
@@ -38,6 +39,7 @@ import boto3
 import tempfile
 from io import BytesIO
 
+
 # ------------------------
 # Load environment variables
 # ------------------------
@@ -64,23 +66,6 @@ def download_db_from_s3(s3_key):
     s3.download_file(BUCKET_NAME, s3_key, local_path)
     return local_path
 
-# def download_db_from_s3(s3_key):
-#     """Download S3 DB file into local project directory (not /tmp)."""
-#     local_dir = os.path.join(os.getcwd(), "downloaded_dbs")
-#     os.makedirs(local_dir, exist_ok=True)
-
-#     filename = os.path.basename(s3_key)
-#     local_path = os.path.join(local_dir, filename)
-
-#     # Skip download if already exists to avoid re-downloading large files
-#     if not os.path.exists(local_path):
-#         st.info(f"Downloading {filename} from S3...")
-#         s3.download_file(BUCKET_NAME, s3_key, local_path)
-#         st.success(f"✅ Downloaded {filename} successfully.")
-#     else:
-#         st.info(f"Using cached copy of {filename}")
-
-#     return local_path
 
 
 # Download
@@ -263,87 +248,193 @@ if "filtered_df" in st.session_state:
 # ------------------------
 # Chatbot Logic
 # ------------------------
-def get_chatbot_response(user_query):
+
+
+# ------------------------
+# Helper: Summarize DataFrame
+# ------------------------
+def generate_dataframe_summary(df):
+    """Generate descriptive summary from filtered DataFrame."""
+    try:
+        numeric_summary = df.describe(include=[np.number]).transpose().round(2)
+        categorical_summary = {
+            col: df[col].value_counts().head(5).to_dict()
+            for col in df.select_dtypes(include='object').columns
+        }
+
+        summary_text = f"""
+        Numerical Summary:
+        {numeric_summary.to_string()}
+
+        Top 5 Categories per Column:
+        {json.dumps(categorical_summary, indent=2)}
+        """
+        return summary_text
+
+    except Exception as e:
+        return f"⚠️ Error while summarizing DataFrame: {e}"
+
+
+# ------------------------
+# Smart Context Detector
+# ------------------------
+def detect_query_relevance(llm, df, user_query):
+    """
+    Use LLM to decide if the question is relevant to the filtered dataset.
+    Returns True if related, False if unrelated.
+    """
+    df_preview = df.head(5).to_dict(orient="records")
+    prompt = f"""
+    You are an intelligent data analyst.
+
+    Here's a preview of the filtered dataset (first few rows):
+    {json.dumps(df_preview, indent=2)}
+
+    The user's question is:
+    "{user_query}"
+
+    Task:
+    - Determine if the user's question is clearly related to this filtered dataset.
+    - For example:
+        * If the question asks about columns, metrics, or values visible in this dataset → it's RELATED.
+        * If it asks about something outside the dataset (e.g., different region, global summary, templates not in this subset) → it's UNRELATED.
+
+    Answer ONLY with:
+    "RELATED" or "UNRELATED"
+    """
+    result = llm.predict(prompt).strip().upper()
+    return "RELATED" in result
+
+
+# ------------------------
+# Generate Analytical Report
+# ------------------------
+def generate_report_with_insights(summary, question, llm, relevance):
+    """
+    Generate a professional analytical report using LLM.
+    """
+    if relevance:
+        context_instruction = "The user's question is related to the filtered dataset."
+    else:
+        context_instruction = "The question seems unrelated to the filtered dataset. Provide context summary instead."
+
+    prompt = f"""
+    You are a senior data analyst working on safety inspection data.
+
+    {context_instruction}
+
+    Filtered Data Summary:
+    {summary}
+
+    User Question:
+    {question}
+
+    Instructions:
+    - If the question is related → answer it using the filtered data insights.
+    - If it's unrelated → say so politely, then summarize what this filtered data represents.
+    - Always include actionable insights and trends if possible.
+    """
+
+    return llm.predict(prompt)
+
+
+# ------------------------
+# Hybrid Logic: SQL + RAG
+# ------------------------
+def get_chatbot_response(user_query, sql_agent, rag_chain):
+    """Use SQL Agent for analytical queries, RAG for general questions."""
     sql_keywords = [
         "average", "sum", "top", "count", "max", "min", "group by", "trend",
-        "between", "total", "where", "order by", "compare", "ratio"
+        "between", "total", "where", "order by", "compare", "ratio", "percentage"
     ]
+
     if any(k in user_query.lower() for k in sql_keywords):
         response = sql_agent.invoke({"input": user_query})
         return response.get("output", "⚠️ No SQL result found.")
     else:
         return rag_chain.run(user_query)
 
-# ------------------------
-# Chatbot Logic Filterd_df
-# ------------------------
-def summarize_filtered_df(df):
-    sql_keywords = [
-        "average", "sum", "top", "count", "max", "min", "group by", "trend",
-        "between", "total", "where", "order by", "compare", "ratio"
-    ]
-    if any(k in df.lower() for k in sql_keywords):
-        response = sql_agent.invoke({"input": df})
-        return response.get("output", "⚠️ No SQL result found.")
-    else:
-        return rag_chain.run(df)
-
-def generate_report_with_insights(summary, question):
-    """
-    Generate a professional report with actionable insights using LLM.
-    """
-    prompt = f"""
-    You are a senior data analyst. You are provided with summary statistics of inspection data.
-    Also, there are visualizations for inspections per region, template, and employee (shown in Streamlit).
-    Use the summary and visualizations to:
-      1. Answer the user's question clearly.
-      2. Highlight key patterns and anomalies.
-      3. show the KPI for templates count.
-      4. Identify top/bottom performing regions, templates, assignee status, reponses or employees.
-      5. Provide actionable recommendations.
-
-    Summary data:
-    {summary}
-
-    Question: {question}
-
-    Return the answer as a professional report in clear English with proper grammar.
-    """
-    return llm.predict(prompt)
 
 # ------------------------
-# Layout
+# Visual Generator
+# ------------------------
+def auto_generate_visuals(df, user_query):
+    """Automatically detect key columns and render visuals relevant to user's question."""
+    st.markdown("### 📊 Auto-Generated Visual Insights")
+    vivid_colors = px.colors.qualitative.Vivid
+
+    try:
+        if "region" in df.columns and "TemplateNames" in df.columns:
+            region_count = df.groupby("region")["TemplateNames"].count().reset_index(name="count")
+            fig = px.bar(region_count, x="region", y="count", text="count",
+                         color="region", color_discrete_sequence=vivid_colors,
+                         title="Inspections by Region")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if "TemplateNames" in df.columns:
+            template_count = df["TemplateNames"].value_counts().head(10).reset_index()
+            template_count.columns = ["TemplateNames", "count"]
+            fig = px.bar(template_count, x="TemplateNames", y="count",
+                         color="TemplateNames", text="count",
+                         title="Top 10 Templates by Inspection Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+        if "owner name" in df.columns:
+            emp_count = df["owner name"].value_counts().head(10).reset_index()
+            emp_count.columns = ["owner name", "count"]
+            fig = px.bar(emp_count, x="owner name", y="count",
+                         color="owner name", text="count",
+                         title="Top 10 Employees by Inspection Count")
+            st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.warning(f"⚠️ Could not generate visuals automatically: {e}")
+
+
+# ------------------------
+# Streamlit Chat Layout
 # ------------------------
 col_left, col_right = st.columns([1, 0.6])
-
-# LEFT: Chatbot
 
 with col_left:
     st.subheader("💬 Ask a Question About the Data")
     user_question = st.text_input("Enter your question:")
 
-    if st.button("Ask ChatGPT"):
+    if st.button("Ask Chatbot"):
         if not user_question.strip():
             st.warning("Please enter a question.")
         else:
             try:
-                # ✅ CASE 1: Use filtered dataframe if available
+                # ✅ CASE 1: filtered_df available
                 if "filtered_df" in st.session_state and not st.session_state["filtered_df"].empty:
                     df = st.session_state["filtered_df"]
-                    summary = summarize_filtered_df(df)
-                    answer = generate_report_with_insights(summary,user_question)
+                    st.info("🔎 Analyzing filtered dataset...")
+
+                    summary = generate_dataframe_summary(df)
+                    relevance = detect_query_relevance(llm, df, user_question)
+
+                    if relevance:
+                        st.success("🧠 Query detected as related to filtered data.")
+                    else:
+                        st.warning("⚠️ Query seems unrelated — summarizing filtered data context.")
+
+                    answer = generate_report_with_insights(summary, user_question, llm, relevance)
                     st.markdown("### 📋 Chatbot Response")
                     st.write(answer)
-                
-                # ✅ CASE 2: Otherwise → use SQL Agent on full DB
+
+                    if relevance:
+                        auto_generate_visuals(df, user_question)
+
+                # ✅ CASE 2: No filtered data → SQL + RAG hybrid
                 else:
-                   
-                    final_answer=get_chatbot_response(user_question)
-                    st.markdown("### 📋 Chatbot Response")
+                    st.info("📚 Querying full dataset via hybrid SQL + RAG...")
+                    final_answer = get_chatbot_response(user_question, sql_agent, rag_chain)
+                    st.markdown("### 📋 Chatbot Response (Full Database)")
                     st.write(final_answer)
 
             except Exception as e:
                 st.error(f"❌ Error: {e}")
+
 
 # ------------------------
 # Right: Visual on Right columns
