@@ -1,24 +1,78 @@
 # Core framework
-streamlit
+#streamlit
 
 # Database connectivity
-SQLAlchemy
-PyMySQL
-pandas
-mysql-connector-python
+#SQLAlchemy
+#PyMySQL
+#pandas
+#mysql-connector-python
 
 # OpenAI & LangChain
-openai
-langchain
-langchain-community
-langchain-openai
+#openai
+#langchain
+#langchain-community
+#langchain-openai
 
 # AWS SDK
+#boto3
+
+# Utilities
+#python-dotenv
+#tqdm
+
+# Optional but useful
+#tenacity
+
+# New updated requirements.txt
+LangChain
+langchain
+langchain-core
+langchain-community
+
+# OpenAI Integration
+langchain-openai
+openai
+
+# --- Vector / RAG Support --- hybrid
+faiss-cpu                # Vector database for embeddings
+tiktoken                 # Needed for token counting with OpenAI embeddings
+sentence-transformers     # Optional: for local embedding models (offline mode)
+
+# LLM + SQL
+sqlalchemy
+pandasql
+
+# Data & ML
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+plotly
+tabulate
+
+# Web & Streamlit
+streamlit
 boto3
+duckdb
+beautifulsoup4
+grandalf
 
 # Utilities
 python-dotenv
-tqdm
+language-tool-python
+pydantic
+pydantic[email]
 
-# Optional but useful
-tenacity
+# SQLite
+sqlite3
+
+
+
+
+
+
+
+
+
+
