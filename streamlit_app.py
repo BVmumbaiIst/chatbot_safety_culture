@@ -41,14 +41,14 @@ from io import BytesIO
 # ------------------------
 # Load environment variables
 # ------------------------
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ------------------------
-# AWS S3 setup
-# ------------------------
+# Load environment variables (AWS credentials and OpenAI key)
+load_dotenv()
+
+# S3 bucket details
 s3 = boto3.client("s3")
 BUCKET_NAME = "iauditorsafetydata"
 S3_KEYS = {
@@ -64,24 +64,18 @@ def download_db_from_s3(s3_key):
     s3.download_file(BUCKET_NAME, s3_key, local_path)
     return local_path
 
-
-
 # Download
 DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
 DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
 
-# ------------------------
-# Database connections
-# ------------------------
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def get_connection_items():
     return sqlite3.connect(DB_PATH_ITEMS, check_same_thread=False)
 
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def get_connection_users():
     return sqlite3.connect(DB_PATH_USERS, check_same_thread=False)
-
-
+    
 # ------------------------
 # Get Filter Options
 # ------------------------
