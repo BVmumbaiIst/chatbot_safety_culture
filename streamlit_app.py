@@ -177,11 +177,13 @@ row_limit = st.sidebar.slider("Limit number of rows:", min_value=10, max_value=5
 # ------------------------
 sql_filters = []
 
+# Date range filter
 if date_range:
     start_date = pd.to_datetime(date_range[0]).strftime("%Y-%m-%d")
     end_date = pd.to_datetime(date_range[1]).strftime("%Y-%m-%d")
     sql_filters.append(f'"date completed" BETWEEN "{start_date}" AND "{end_date}"')
 
+# Other filters
 if region:
     sql_filters.append(f'region IN ({",".join([f"\'{r}\'" for r in region])})')
 if template:
@@ -196,6 +198,7 @@ if employee_status:
 where_clause = " AND ".join(sql_filters) if sql_filters else "1=1"
 default_query = f'SELECT * FROM inspection_employee_schedule_items WHERE {where_clause} LIMIT {row_limit};'
 sql_query = st.sidebar.text_area("✏️ Edit SQL Query", value=default_query, height=120)
+st.sidebar.markdown("### 🔍 Final SQL Query")
 st.sidebar.code(sql_query, language="sql")
 
 if st.sidebar.button("Run Query"):
