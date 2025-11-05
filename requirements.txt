@@ -24,13 +24,13 @@
 #tenacity
 
 # New updated requirements.txt
-LangChain
 langchain
 langchain-core
 langchain-community
+langchain-openai
+langchain-experimental
 
 # OpenAI Integration
-langchain-openai
 openai
 
 # --- Vector / RAG Support --- hybrid
