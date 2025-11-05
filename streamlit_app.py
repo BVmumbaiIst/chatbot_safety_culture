@@ -323,7 +323,7 @@ def detect_query_relevance(llm, df, user_query):
     """
 
     
-    result = llm.predict(prompt).strip().upper()
+    result = llm.invoke(prompt).strip().upper()
     return "RELATED" in result
 
 
@@ -357,7 +357,7 @@ def generate_report_with_insights(summary, question, llm, relevance):
     - Always include actionable insights and trends if possible.
     """
 
-    return llm.predict(prompt)
+    return llm.invoke(prompt)
 
 
 # ------------------------
