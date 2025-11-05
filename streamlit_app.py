@@ -15,8 +15,6 @@ import language_tool_python  # for grammar check
 
 # --- LangChain imports ---
 from langchain_community.chat_models import ChatOpenAI
-
-from langchain.chains import LLMChain, RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities import SQLDatabase
