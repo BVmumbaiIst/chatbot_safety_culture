@@ -15,7 +15,7 @@ import language_tool_python  # for grammar check
 
 # --- LangChain imports ---
 from langchain_community.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
+
 from langchain.chains import LLMChain, RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_community.agent_toolkits import create_sql_agent
@@ -107,20 +107,19 @@ def get_valid_emails(conn_users):
 
 
 # ------------------------
-# LLM Setup
+# LLM + Memory
 # ------------------------
 @st.cache_resource
-def setup_llm_memory():
+def setup_llm():
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
         openai_api_key=OPENAI_API_KEY
     )
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    return llm, memory
+    return llm
 
-
-llm, memory = setup_llm_memory()
+# Initialize LLM
+llm = setup_llm()
 
 # ------------------------
 # Streamlit Config
@@ -257,8 +256,6 @@ if "filtered_df" in st.session_state:
 # ------------------------
 # Chatbot Logic
 # ------------------------
-
-
 # ------------------------
 # Helper: Summarize DataFrame
 # ------------------------
