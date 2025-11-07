@@ -610,7 +610,6 @@ with col_left:
 # ------------------------
 # Right: Visual on Right columns
 # ------------------------
-
 def apply_chart_theme(fig):
     """Apply a consistent transparent visual theme."""
     fig.update_layout(
