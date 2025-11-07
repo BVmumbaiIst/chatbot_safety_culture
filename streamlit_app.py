@@ -3,15 +3,12 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 import json
-import re
-
 import numpy as np
 import traceback
 from datetime import datetime
 from dotenv import load_dotenv
-from pandasql import sqldf
 from tabulate import tabulate
-import language_tool_python  # for grammar check
+import language_tool_python
 
 # --- LangChain imports ---
 from langchain_openai import ChatOpenAI
@@ -35,68 +32,228 @@ from openai import OpenAI
 
 # --- AWS + Utilities ---
 import boto3
+import io
 import tempfile
-from io import BytesIO
+import atexit
+import time
+from botocore.exceptions import ClientError
+import uuid
 
 
+DEBUG = False 
 # ------------------------
 # Load environment variables
 # ------------------------
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Load environment variables (AWS credentials and OpenAI key)
 load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# S3 bucket details
-s3 = boto3.client("s3")
+if not OPENAI_API_KEY:
+    st.warning("⚠️ OPENAI_API_KEY not found in environment — LLM calls may fail.")
+else:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ------------------------
+# S3 configuration
+# ------------------------
 BUCKET_NAME = "iauditorsafetydata"
 S3_KEYS = {
     "items": "BVPI_Safety_Optimise/safety_Chat_bot_db/inspection_employee_schedule_items.db",
-    "users": "BVPI_Safety_Optimise/safety_Chat_bot_db/inspection_employee_schedule.db"
+    "users": "BVPI_Safety_Optimise/safety_Chat_bot_db/inspection_employee_schedule_users.db"
 }
 
-def download_db_from_s3(s3_key):
-    # Create a truly unique temp file
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    local_path = tmp_file.name
-    tmp_file.close()  # close it so Windows releases the lock
-    s3.download_file(BUCKET_NAME, s3_key, local_path)
-    return local_path
+s3 = boto3.client("s3")
 
-# Download
-DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
-DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
+# ------------------------
+# Helper: Clean old temp DB files (>24 hours)
+# ------------------------
+def cleanup_old_dbs(tmp_dir=tempfile.gettempdir(), hours=24):
+    cutoff = time.time() - hours * 1800
+    for file in os.listdir(tmp_dir):
+        if file.endswith(".db"):
+            path = os.path.join(tmp_dir, file)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except Exception:
+                pass
+# ------------------------
+# Helper: Verify S3 object
+# ------------------------
+def verify_s3_file(bucket, key):
+    """Check if the file exists in S3 and return size."""
+    try:
+        response = s3.head_object(Bucket=bucket, Key=key)
+        size_mb = response["ContentLength"] / (1024 * 1024)
+        return size_mb
+    except ClientError as e:
+        raise FileNotFoundError(f"File not found or no permission: {key}\n{e}")
+# ------------------------
+# Load SQLite safely from S3 (silent version)
+# ------------------------
+def load_sqlite_from_s3(s3_key: str):
+    """Download SQLite DB safely from S3, ensuring complete file before use."""
+    # Step 1: Verify S3 file
+    head = s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+    size_mb = head["ContentLength"] / (1024 * 1024)
 
-@st.cache_resource(ttl=3600)
+    # Step 2: Create unique local path
+    unique_suffix = str(uuid.uuid4())[:8]
+    local_path = os.path.join(
+        tempfile.gettempdir(), f"{os.path.basename(s3_key).split('.')[0]}_{unique_suffix}.db"
+    )
+
+    # Step 3: Download with retry
+    for attempt in range(3):
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+
+            s3.download_file(BUCKET_NAME, s3_key, local_path)
+
+            # Validate file
+            if os.path.getsize(local_path) < 1024:
+                raise ValueError("File too small — possibly incomplete")
+
+            conn = sqlite3.connect(local_path)
+            tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+            conn.close()
+
+            if tables.empty:
+                raise ValueError("No tables found — possibly corrupted")
+
+            # Delete temp DB on exit
+            atexit.register(lambda: os.path.exists(local_path) and os.remove(local_path))
+            return local_path
+
+        except Exception:
+            time.sleep(2)
+
+    raise RuntimeError(f"Failed to download and verify {s3_key} after multiple attempts.")
+
+# ------------------------
+# Safe DB connection + table detection
+# ------------------------
+def get_first_table_name(conn):
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+    if tables.empty:
+        raise ValueError("No tables found in the database.")
+    return tables.iloc[0, 0]
+
+def load_table_dynamic(db_path, expected_table_name=None):
+    """Loads the table by expected name or auto-detects if not found."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+        available = tables["name"].tolist()
+
+        # Pick best match (case-insensitive)
+        if expected_table_name:
+            match = next((t for t in available if t.lower() == expected_table_name.lower()), None)
+        else:
+            match = None
+
+        if not match:
+            match = get_first_table_name(conn)
+
+        df = pd.read_sql(f'SELECT * FROM "{match}"', conn)
+        conn.close()
+        return df
+
+    except Exception as e:
+        print(f"❌ Failed to load from {db_path}: {e}")
+        return pd.DataFrame()
+
+# ------------------------
+# Download both DBs silently
+# ------------------------
+try:
+    DB_PATH_ITEMS = load_sqlite_from_s3(S3_KEYS["items"])
+    DB_PATH_USERS = load_sqlite_from_s3(S3_KEYS["users"])
+except Exception as e:
+    print(f"❌ Failed to load databases: {e}")
+    DB_PATH_ITEMS = DB_PATH_USERS = None
+
+# ------------------------
+# Load both datasets
+# ------------------------
+df_items = load_table_dynamic(DB_PATH_ITEMS, "inspection_employee_schedule_items")
+df_users = load_table_dynamic(DB_PATH_USERS, "inspection_employee_schedule_users")
+
+# ------------------------
+# Utility: Get single table name from SQLite DB
+# ------------------------
+def get_single_table_name(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [r[0] for r in cursor.fetchall()]
+    if not tables:
+        raise ValueError("No tables found in the database.")
+    return tables[0]
+
+# ------------------------
+# Database connections (assumes your S3 load already set paths)
+# ------------------------
 def get_connection_items():
-    return sqlite3.connect(DB_PATH_ITEMS, check_same_thread=False)
+    return sqlite3.connect(DB_PATH_ITEMS)
 
-@st.cache_resource(ttl=3600)
 def get_connection_users():
-    return sqlite3.connect(DB_PATH_USERS, check_same_thread=False)
+    return sqlite3.connect(DB_PATH_USERS)
     
 # ------------------------
-# Get Filter Options
+# Extract filter options safely
 # ------------------------
 def get_filter_options_items(conn_items):
-    df = pd.read_sql("SELECT * FROM inspection_employee_schedule_items", conn_items)
-    df["date completed"] = pd.to_datetime(df["date completed"], errors="coerce")
-    return {
-        "date_min": df["date completed"].min(),
-        "date_max": df["date completed"].max(),
-        "regions": sorted(df["region"].dropna().unique().tolist()),
-        "templates": sorted(df["TemplateNames"].dropna().unique().tolist()),
-        "employees": sorted(df["owner name"].dropna().unique().tolist()),
-        "statuses": sorted(df["assignee status"].dropna().unique().tolist()),
-        "employeestatus": sorted(df["employee status"].dropna().unique().tolist())
+    table = get_single_table_name(conn_items)
+    if DEBUG:
+        st.info(f"Using items DB table: {table}")
+
+    df = pd.read_sql(f'SELECT * FROM "{table}"', conn_items)
+
+    if "date completed" in df.columns:
+        df["date completed"] = pd.to_datetime(df["date completed"], errors="coerce")
+
+    filters = {
+        "date_min": df["date completed"].min() if "date completed" in df.columns else None,
+        "date_max": df["date completed"].max() if "date completed" in df.columns else None,
+        "regions": sorted(df["region"].dropna().unique().tolist()) if "region" in df.columns else [],
+        "templates": sorted(df["TemplateNames"].dropna().unique().tolist()) if "TemplateNames" in df.columns else [],
+        "employees": sorted(df["owner name"].dropna().unique().tolist()) if "owner name" in df.columns else [],
+        "statuses": sorted(df["assignee status"].dropna().unique().tolist()) if "assignee status" in df.columns else [],
+        "employeestatus": sorted(df["employee status"].dropna().unique().tolist()) if "employee status" in df.columns else []
     }
+
+    return filters
 
 
 def get_valid_emails(conn_users):
-    df_user = pd.read_sql("SELECT * FROM inspection_employee_schedule", conn_users)
-    return sorted(df_user["email"].dropna().unique().tolist())
+    table = get_single_table_name(conn_users)
+    if DEBUG:
+        st.info(f"Using users DB table: {table}")
+
+    df_user = pd.read_sql(f'SELECT * FROM "{table}"', conn_users)
+    return sorted(df_user["email"].dropna().unique().tolist()) if "email" in df_user.columns else []
+    
+# ------------------------
+# Load and Validate Databases
+# ------------------------
+try:
+    conn_items = get_connection_items()
+    conn_users = get_connection_users()
+
+    filters = get_filter_options_items(conn_items)
+    emails = get_valid_emails(conn_users)
+
+    # Clean UI message only
+    st.success("✅ Data loaded successfully and chatbot is ready.")
+
+except Exception as e:
+    st.error(f"❌ Failed to load data: {e}")
+
+finally:
+    if 'conn_items' in locals():
+        conn_items.close()
+    if 'conn_users' in locals():
+        conn_users.close()
 
 
 # ------------------------
@@ -115,18 +272,30 @@ def setup_llm():
 llm = setup_llm()
 
 # ------------------------
-# Streamlit Config
+# Streamlit UI basic config
 # ------------------------
 st.set_page_config(page_title="Interactive Data Chatbot", layout="wide")
-st.title("💬 Interactive Data Chatbot + Analytics")
+st.title("💬 Interactive Data Chatbot + Analytics (Fixed)")
 
+# If DB paths missing, stop
+if DB_PATH_ITEMS is None or DB_PATH_USERS is None:
+    st.stop()
+
+# Create connections
 conn_items = get_connection_items()
 conn_users = get_connection_users()
-filters_items = get_filter_options_items(conn_items)
+
+# Get filter options and valid emails
+try:
+    filters_items = get_filter_options_items(conn_items)
+except Exception as e:
+    st.error(f"Failed to load filter options from items DB: {e}")
+    st.stop()
+
 valid_emails = get_valid_emails(conn_users)
 
 # ------------------------
-# Sidebar Login
+# Sidebar login & filters
 # ------------------------
 with st.sidebar:
     st.header("🔑 Login")
@@ -153,7 +322,7 @@ if not st.session_state.get("logged_in", False):
 st.sidebar.header("🔎 Apply Filters")
 date_range = st.sidebar.date_input(
     "Select Date Range",
-    [filters_items["date_min"], filters_items["date_max"]],
+    [filters_items["date_min"], filters_items["date_max"]] if filters_items["date_min"] is not None else [],
     min_value=filters_items["date_min"],
     max_value=filters_items["date_max"]
 )
@@ -167,36 +336,27 @@ row_limit = st.sidebar.slider("Limit number of rows:", min_value=10, max_value=5
 # ------------------------
 # Dynamic SQL Query Builder
 # ------------------------
-sql_filters = []
+items_table_name = get_single_table_name(conn_items)
 
-# Date range filter
+sql_filters = []
 if date_range:
     start_date = pd.to_datetime(date_range[0]).strftime("%Y-%m-%d")
     end_date = pd.to_datetime(date_range[1]).strftime("%Y-%m-%d")
     sql_filters.append(f'"date completed" BETWEEN "{start_date}" AND "{end_date}"')
-
-# Other filters
 if region:
-    region_list = ", ".join([f"'{r}'" for r in region])
-    sql_filters.append(f"region IN ({region_list})")
+    sql_filters.append(f'region IN ({",".join([f"\'{r}\'" for r in region])})')
 if template:
-    template_list = ", ".join([f"'{t}'" for t in template])
-    sql_filters.append(f'"TemplateNames" IN ({template_list})')
+    sql_filters.append(f'"TemplateNames" IN ({",".join([f"\'{t}\'" for t in template])})')
 if employee:
-    employee_list = ", ".join([f"'{e}'" for e in employee])
-    sql_filters.append(f'"owner name" IN ({employee_list})')
+    sql_filters.append(f'"owner name" IN ({",".join([f"\'{e}\'" for e in employee])})')
 if status:
-    status_list = ", ".join([f"'{s}'" for s in status])
-    sql_filters.append(f'"assignee status" IN ({status_list})')
+    sql_filters.append(f'"assignee status" IN ({",".join([f"\'{s}\'" for s in status])})')
 if employee_status:
-    employee_status_list = ", ".join([f"'{es}'" for es in employee_status])
-    sql_filters.append(f'"employee status" IN ({employee_status_list})')
-
+    sql_filters.append(f'"employee status" IN ({",".join([f"\'{es}\'" for es in employee_status])})')
 
 where_clause = " AND ".join(sql_filters) if sql_filters else "1=1"
-default_query = f'SELECT * FROM inspection_employee_schedule_items WHERE {where_clause} LIMIT {row_limit};'
-sql_query = st.sidebar.text_area("✏️ Edit SQL Query", value=default_query, height=120)
-st.sidebar.markdown("### 🔍 Final SQL Query")
+default_query = f'SELECT * FROM "{items_table_name}" WHERE {where_clause} LIMIT {row_limit};'
+sql_query = st.sidebar.text_area("✏️ Edit SQL Query", value=default_query, height=140)
 st.sidebar.code(sql_query, language="sql")
 
 if st.sidebar.button("Run Query"):
@@ -213,27 +373,28 @@ if st.sidebar.button("Run Query"):
 # ------------------------
 @st.cache_resource
 def setup_sql_agent():
+    # use local DB path (DB_PATH_ITEMS) for agent
     db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH_ITEMS}")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
-    return create_sql_agent(llm=llm, db=db, agent_type="openai-tools", verbose=True)
-
+    llm_local = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    return create_sql_agent(llm=llm_local, db=db, agent_type="openai-tools", verbose=True)
 
 @st.cache_resource
 def setup_vector_rag():
-    """Setup FAISS retriever once and reuse."""
+    # Build vectorstore from items DB table
     engine = create_engine(f"sqlite:///{DB_PATH_ITEMS}")
-    df = pd.read_sql("SELECT * FROM inspection_employee_schedule_items LIMIT 20000", engine)
-
+    # detect table name again
+    try:
+        df = pd.read_sql(f'SELECT * FROM "{items_table_name}" LIMIT 20000', engine)
+    except Exception:
+        df = pd.read_sql(f'SELECT * FROM "{items_table_name}" LIMIT 2000', engine)  # fallback smaller
     docs = [Document(page_content=row.to_json(), metadata={"row": i}) for i, row in df.iterrows()]
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
-
-    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
-    return RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
+    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    vectorstore = FAISS.from_documents(chunks, embeddings) if embeddings else None
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) if vectorstore else None
+    llm_local = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    return RetrievalQA.from_chain_type(llm=llm_local, retriever=retriever, chain_type="stuff") if retriever else None
 
 sql_agent = setup_sql_agent()
 rag_chain = setup_vector_rag()
@@ -252,23 +413,15 @@ if "filtered_df" in st.session_state:
 # Helper: Summarize DataFrame
 # ------------------------
 def generate_dataframe_summary(df):
-    """Generate descriptive summary from filtered DataFrame."""
+    """Return a textual summary for the LLM."""
     try:
         numeric_summary = df.describe(include=[np.number]).transpose().round(2)
         categorical_summary = {
             col: df[col].value_counts().head(5).to_dict()
             for col in df.select_dtypes(include='object').columns
         }
-
-        summary_text = f"""
-        Numerical Summary:
-        {numeric_summary.to_string()}
-
-        Top 5 Categories per Column:
-        {json.dumps(categorical_summary, indent=2)}
-        """
+        summary_text = f"Numerical Summary:\n{numeric_summary.to_string()}\n\nTop 5 Categories per Column:\n{json.dumps(categorical_summary, indent=2)}"
         return summary_text
-
     except Exception as e:
         return f"⚠️ Error while summarizing DataFrame: {e}"
 
@@ -276,84 +429,90 @@ def generate_dataframe_summary(df):
 # ------------------------
 # Smart Context Detector
 # ------------------------
-def detect_query_relevance(llm, df, user_query):
-    """
-    Use LLM to decide if the question is relevant to the filtered dataset.
-    Returns True if related, False if unrelated.
-    """
+def detect_query_relevance(llm_model, df, user_query):
+    """Ask the LLM whether the user_query is related to the filtered df preview."""
+    if llm_model is None:
+        # fallback heuristic: check if any column name or top values appear in query
+        q = user_query.lower()
+        for col in df.select_dtypes(include='object').columns:
+            if col.lower() in q:
+                return True
+            top_vals = df[col].dropna().astype(str).unique()[:5]
+            if any(str(v).lower() in q for v in top_vals):
+                return True
+        return False
+
     df_preview = df.head(5).to_dict(orient="records")
     prompt = f"""
-    You are an intelligent data analyst.
+You are an assistant. Here is a preview of the filtered dataset (first rows):
+{json.dumps(df_preview, indent=2)}
 
-    Here's a preview of the filtered dataset (first few rows):
-    {json.dumps(df_preview, indent=2)}
+The user's question:
+"{user_query}"
+Task: respond ONLY with RELATED or UNRELATED depending on whether the user's question is clearly about the data shown."""
+    try:
+        out = llm_model.invoke(prompt).strip().upper()
+        return "RELATED" in out
+    except Exception:
+        # fallback heuristic
+        return detect_query_relevance(None, df, user_query)
 
-    The user's question is:
-    "{user_query}"
-
-    Task:
-    - Determine if the user's question is clearly related to this filtered dataset.
-    - For example:
-        * If the question asks about columns, metrics, or values visible in this dataset → it's RELATED.
-        * If it asks about something outside the dataset (e.g., different region, global summary, templates not in this subset) → it's UNRELATED.
-
-    Answer ONLY with: 
-    "RELATED" or "UNRELATED".
-    """
-
-    
-    result = llm.invoke(prompt).strip().upper()
-    return "RELATED" in result
 
 
 
 # ------------------------
 # Generate Analytical Report
 # ------------------------
-def generate_report_with_insights(summary, question, llm, relevance):
-    """
-    Generate a professional analytical report using LLM.
-    """
-    if relevance:
-        context_instruction = "The user's question is related to the filtered dataset."
-    else:
-        context_instruction = "The question seems unrelated to the filtered dataset. Provide context summary instead."
-
+def generate_report_with_insights(summary, question, llm_model, relevance):
+    if llm_model is None:
+        # simple fallback textual report
+        if relevance:
+            return f"(No LLM available) The filtered data summary:\n{summary}\nQuestion: {question}"
+        else:
+            return f"(No LLM available) Your question doesn't look related to the filtered data. Summary of filtered data:\n{summary}"
+    ctx = "The user's question is related to the filtered dataset." if relevance else "The question seems unrelated; provide a short summary of the filtered data instead."
     prompt = f"""
-    You are a senior data analyst working on safety inspection data.
+You are a senior data analyst.
 
-    {context_instruction}
+{ctx}
 
-    Filtered Data Summary:
-    {summary}
+Filtered data summary:
+{summary}
 
-    User Question:
-    {question}
+User question:
+{question}
 
-    Instructions:
-    - If the question is related → answer it using the filtered data insights.
-    - If it's unrelated → say so politely, then summarize what this filtered data represents.
-    - Always include actionable insights and trends if possible.
-    """
-
-    return llm.invoke(prompt)
+Requirements:
+- If related -> answer using the filtered data and highlight top/bottom performers, anomalies, and 2 actionable recommendations.
+- If unrelated -> politely state it's unrelated and provide a concise summary of the filtered data.
+Keep it professional and concise.
+"""
+    return llm_model.invoke(prompt)
 
 
 # ------------------------
 # Hybrid Logic: SQL + RAG
 # ------------------------
-def get_chatbot_response(user_query, sql_agent, rag_chain):
-    """Use SQL Agent for analytical queries, RAG for general questions."""
+# hybrid routing
+def get_chatbot_response(user_query):
     sql_keywords = [
         "average", "sum", "top", "count", "max", "min", "group by", "trend",
         "between", "total", "where", "order by", "compare", "ratio", "percentage"
     ]
-
-    if any(k in user_query.lower() for k in sql_keywords):
-        response = sql_agent.invoke({"input": user_query})
-        return response.get("output", "⚠️ No SQL result found.")
+    q = user_query.lower()
+    if any(k in q for k in sql_keywords) and sql_agent:
+        try:
+            response = sql_agent.invoke({"input": user_query})
+            return response.get("output", "⚠️ No SQL result found.")
+        except Exception as e:
+            return f"❌ SQL Agent error: {e}"
+    elif rag_chain:
+        try:
+            return rag_chain.run(user_query)
+        except Exception as e:
+            return f"❌ RAG error: {e}"
     else:
-        return rag_chain.run(user_query)
+        return "⚠️ No LLM or retriever available."
 
 # ------------------------
 # Visual Generator
@@ -391,6 +550,7 @@ def auto_generate_visuals(df, user_query):
         st.warning(f"⚠️ Could not generate visuals automatically: {e}")
 
 
+
 # ------------------------
 # Streamlit Chat Layout
 # ------------------------
@@ -421,7 +581,7 @@ with col_left:
                     answer = generate_report_with_insights(summary, user_question, llm, relevance)
                     st.markdown("### 📋 Chatbot Response")
                     st.write(answer)
-
+                    
                     if relevance:
                         auto_generate_visuals(df, user_question)
 
@@ -433,7 +593,6 @@ with col_left:
                     st.write(final_answer)
 
             except Exception as e:
-                st.error(f"❌ Error: {e}")
 
 
 # ------------------------
@@ -612,4 +771,6 @@ with col_right:
 
     else:
         st.info("ℹ️ No data loaded yet. Please apply filters and click 'Run Query' first.")
+
+
 
