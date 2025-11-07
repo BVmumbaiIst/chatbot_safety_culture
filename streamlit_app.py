@@ -482,7 +482,13 @@ def generate_report_with_insights(summary, question, llm_model, relevance):
             return f"(No LLM available) The filtered data summary:\n{summary}\nQuestion: {question}"
         else:
             return f"(No LLM available) Your question doesn't look related to the filtered data. Summary of filtered data:\n{summary}"
-    ctx = "The user's question is related to the filtered dataset." if relevance else "The question seems unrelated; provide a short summary of the filtered data instead."
+
+    ctx = (
+        "The user's question is related to the filtered dataset."
+        if relevance
+        else "The question seems unrelated; provide a short summary of the filtered data instead."
+    )
+
     prompt = f"""
 You are a senior data analyst.
 
@@ -499,14 +505,24 @@ Requirements:
 - If unrelated -> politely state it's unrelated and provide a concise summary of the filtered data.
 Keep it professional and concise.
 """
-    return llm_model.invoke(prompt)
+
+    try:
+        response = llm_model.invoke(prompt)
+        # ✅ Extract text properly (handles both LangChain and dict outputs)
+        if hasattr(response, "content"):
+            return response.content
+        elif isinstance(response, dict) and "content" in response:
+            return response["content"]
+        else:
+            return str(response)
+    except Exception as e:
+        return f"❌ Error generating report: {e}"
 
 
 # ------------------------
 # Hybrid Logic: SQL + RAG
 # ------------------------
-# hybrid routing
-def get_chatbot_response(user_query):
+def get_chatbot_response(user_query, sql_agent=None, rag_chain=None):
     sql_keywords = [
         "average", "sum", "top", "count", "max", "min", "group by", "trend",
         "between", "total", "where", "order by", "compare", "ratio", "percentage"
@@ -520,11 +536,13 @@ def get_chatbot_response(user_query):
             return f"❌ SQL Agent error: {e}"
     elif rag_chain:
         try:
-            return rag_chain.run(user_query)
+            response = rag_chain.run(user_query)
+            return response
         except Exception as e:
             return f"❌ RAG error: {e}"
     else:
         return "⚠️ No LLM or retriever available."
+
 
 # ------------------------
 # Visual Generator
