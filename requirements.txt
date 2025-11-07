@@ -32,7 +32,7 @@ langchain-experimental
 langchain-text-splitters
 langchain-chroma
 faiss-cpu
-
+langchain-classic
 # OpenAI Integration
 openai
 
