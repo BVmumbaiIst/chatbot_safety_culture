@@ -623,6 +623,7 @@ with col_left:
                     st.write(final_answer)
 
             except Exception as e:
+                st.error(f"❌ Error: {e}")
 
 
 # ------------------------
