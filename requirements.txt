@@ -29,6 +29,9 @@ langchain-core
 langchain-community
 langchain-openai
 langchain-experimental
+langchain-text-splitters
+langchain-chroma
+faiss-cpu
 
 # OpenAI Integration
 openai
