@@ -339,25 +339,37 @@ row_limit = st.sidebar.slider("Limit number of rows:", min_value=10, max_value=5
 items_table_name = get_single_table_name(conn_items)
 
 sql_filters = []
+
 if date_range:
     start_date = pd.to_datetime(date_range[0]).strftime("%Y-%m-%d")
     end_date = pd.to_datetime(date_range[1]).strftime("%Y-%m-%d")
     sql_filters.append(f'"date completed" BETWEEN "{start_date}" AND "{end_date}"')
+
 if region:
-    sql_filters.append(f'region IN ({",".join([f"\'{r}\'" for r in region])})')
+    region_values = ",".join([f"'{r}'" for r in region])
+    sql_filters.append(f"region IN ({region_values})")
+
 if template:
-    sql_filters.append(f'"TemplateNames" IN ({",".join([f"\'{t}\'" for t in template])})')
+    template_values = ",".join([f"'{t}'" for t in template])
+    sql_filters.append(f'"TemplateNames" IN ({template_values})')
+
 if employee:
-    sql_filters.append(f'"owner name" IN ({",".join([f"\'{e}\'" for e in employee])})')
+    employee_values = ",".join([f"'{e}'" for e in employee])
+    sql_filters.append(f'"owner name" IN ({employee_values})')
+
 if status:
-    sql_filters.append(f'"assignee status" IN ({",".join([f"\'{s}\'" for s in status])})')
+    status_values = ",".join([f"'{s}'" for s in status])
+    sql_filters.append(f'"assignee status" IN ({status_values})')
+
 if employee_status:
-    sql_filters.append(f'"employee status" IN ({",".join([f"\'{es}\'" for es in employee_status])})')
+    employee_status_values = ",".join([f"'{es}'" for es in employee_status])
+    sql_filters.append(f'"employee status" IN ({employee_status_values})')
 
 where_clause = " AND ".join(sql_filters) if sql_filters else "1=1"
 default_query = f'SELECT * FROM "{items_table_name}" WHERE {where_clause} LIMIT {row_limit};'
 sql_query = st.sidebar.text_area("✏️ Edit SQL Query", value=default_query, height=140)
 st.sidebar.code(sql_query, language="sql")
+
 
 if st.sidebar.button("Run Query"):
     try:
