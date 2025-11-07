@@ -12,7 +12,7 @@ import language_tool_python
 
 # --- LangChain imports ---
 from langchain_openai import ChatOpenAI
-from langchain.chains.llm import LLMChain
+from langchain_classic.chains import LLMChain
 from langchain.chains.retrieval import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from langchain_community.agent_toolkits import create_sql_agent
