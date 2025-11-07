@@ -12,7 +12,8 @@ import language_tool_python
 
 # --- LangChain imports ---
 from langchain_openai import ChatOpenAI
-from langchain.chains import LLMChain, RetrievalQA
+from langchain.chains.llm import LLMChain
+from langchain.chains.retrieval import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.utilities import SQLDatabase
