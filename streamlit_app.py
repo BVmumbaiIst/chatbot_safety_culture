@@ -242,25 +242,31 @@ def get_valid_emails(conn_users):
 # ------------------------
 # Load and Validate Databases
 # ------------------------
-try:
-    conn_items = get_connection_items()
-    conn_users = get_connection_users()
+def load_and_validate_databases():
+    """Safely load SQLite DB connections and return filter + user data."""
+    try:
+        conn_items = get_connection_items()
+        conn_users = get_connection_users()
 
-    filters = get_filter_options_items(conn_items)
-    emails = get_valid_emails(conn_users)
+        filters = get_filter_options_items(conn_items)
+        emails = get_valid_emails(conn_users)
 
-    # Clean UI message only
-    st.success("✅ Data loaded successfully and chatbot is ready.")
+        st.success("✅ Data loaded successfully and chatbot is ready.")
+        return filters, emails
 
-except Exception as e:
-    st.error(f"❌ Failed to load data: {e}")
+    except Exception as e:
+        st.error(f"❌ Failed to load data: {e}")
+        return None, None
 
-finally:
-    if 'conn_items' in locals():
-        conn_items.close()
-    if 'conn_users' in locals():
-        conn_users.close()
-
+    finally:
+        # Always close DB connections safely
+        try:
+            if 'conn_items' in locals() and conn_items:
+                conn_items.close()
+            if 'conn_users' in locals() and conn_users:
+                conn_users.close()
+        except Exception:
+            pass
 
 # ------------------------
 # LLM + Memory
@@ -275,21 +281,33 @@ def setup_llm():
     return llm
 
 # Initialize LLM
-llm = setup_llm()
+# llm = setup_llm()
 
 # ------------------------
 # Streamlit UI basic config
 # ------------------------
-st.set_page_config(page_title="Interactive Data Chatbot", layout="wide")
-st.title("💬 Interactive Data Chatbot + Analytics (Fixed)")
+st.set_page_config(page_title="💬 Interactive Data Chatbot", layout="wide")
+st.title("💬 Interactive Data Chatbot + Analytics Dashboard")
 
-# If DB paths missing, stop
+# Stop execution early if DB paths are missing
 if DB_PATH_ITEMS is None or DB_PATH_USERS is None:
+    st.error("❌ Database paths not found. Please check S3 connection.")
     st.stop()
 
-# Create connections
+# Load DB filters and email data
+filters_items, valid_emails = load_and_validate_databases()
+
+if not filters_items or not valid_emails:
+    st.error("⚠️ Could not initialize chatbot due to missing data.")
+    st.stop()
+
+# Initialize cached LLM instance
+llm = setup_llm()
+
+# Reopen SQLite connections for runtime operations
 conn_items = get_connection_items()
 conn_users = get_connection_users()
+
 
 # Get filter options and valid emails
 try:
