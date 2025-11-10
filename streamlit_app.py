@@ -65,16 +65,6 @@ S3_KEYS = {
 
 s3 = boto3.client("s3")
 
-# def download_db_from_s3(s3_key):
-#     # Create a truly unique temp file
-#     tmp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-#     local_path = tmp_file.name
-#     tmp_file.close()  # close it so Windows releases the lock
-#     s3.download_file(BUCKET_NAME, s3_key, local_path)
-#     return local_path
-    
-# DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
-# DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
 # ------------------------
 # Cleanup old temp DB files (>24 hours)
 # ------------------------
@@ -273,15 +263,18 @@ def load_and_validate_databases():
 # ------------------------
 @st.cache_resource
 def setup_llm():
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
-        openai_api_key=OPENAI_API_KEY
-    )
-    return llm
+    try:
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            openai_api_key=OPENAI_API_KEY
+        )
+        return llm
+    except Exception as e:
+        st.error(f"⚠️ LLM initialization failed: {e}")
+        return None
 
-# Initialize LLM
-# llm = setup_llm()
+llm = setup_llm()
 
 # ------------------------
 # Streamlit UI basic config
@@ -300,9 +293,6 @@ filters_items, valid_emails = load_and_validate_databases()
 if not filters_items or not valid_emails:
     st.error("⚠️ Could not initialize chatbot due to missing data.")
     st.stop()
-
-# Initialize cached LLM instance
-llm = setup_llm()
 
 # Reopen SQLite connections for runtime operations
 conn_items = get_connection_items()
