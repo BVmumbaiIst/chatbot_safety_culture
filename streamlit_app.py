@@ -26,6 +26,7 @@ from langchain_core.documents import Document
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
+from streamlit_extras.metric_cards import style_metric_cards
 
 # --- Database ---
 from sqlalchemy import create_engine
@@ -64,131 +65,125 @@ S3_KEYS = {
 
 s3 = boto3.client("s3")
 
-def download_db_from_s3(s3_key):
-    # Create a truly unique temp file
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    local_path = tmp_file.name
-    tmp_file.close()  # close it so Windows releases the lock
-    s3.download_file(BUCKET_NAME, s3_key, local_path)
-    return local_path
+# def download_db_from_s3(s3_key):
+#     # Create a truly unique temp file
+#     tmp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+#     local_path = tmp_file.name
+#     tmp_file.close()  # close it so Windows releases the lock
+#     s3.download_file(BUCKET_NAME, s3_key, local_path)
+#     return local_path
     
-DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
-DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
-# # ------------------------
-# # Helper: Clean old temp DB files (>24 hours)
-# # ------------------------
-# def cleanup_old_dbs(tmp_dir=tempfile.gettempdir(), hours=24):
-#     cutoff = time.time() - hours * 1800
-#     for file in os.listdir(tmp_dir):
-#         if file.endswith(".db"):
-#             path = os.path.join(tmp_dir, file)
-#             try:
-#                 if os.path.getmtime(path) < cutoff:
-#                     os.remove(path)
-#             except Exception:
-#                 pass
-# # ------------------------
-# # Helper: Verify S3 object
-# # ------------------------
-# def verify_s3_file(bucket, key):
-#     """Check if the file exists in S3 and return size."""
-#     try:
-#         response = s3.head_object(Bucket=bucket, Key=key)
-#         size_mb = response["ContentLength"] / (1024 * 1024)
-#         return size_mb
-#     except ClientError as e:
-#         raise FileNotFoundError(f"File not found or no permission: {key}\n{e}")
-# # ------------------------
-# # Load SQLite safely from S3 (silent version)
-# # ------------------------
-# def load_sqlite_from_s3(s3_key: str):
-#     """Download SQLite DB safely from S3, ensuring complete file before use."""
-#     # Step 1: Verify S3 file
-#     head = s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)
-#     size_mb = head["ContentLength"] / (1024 * 1024)
+# DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
+# DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
+# ------------------------
+# Cleanup old temp DB files (>24 hours)
+# ------------------------
+def cleanup_old_dbs(tmp_dir=tempfile.gettempdir(), hours=24):
+    cutoff = time.time() - hours * 3600  # 24 hours
+    for file in os.listdir(tmp_dir):
+        if file.endswith(".db"):
+            path = os.path.join(tmp_dir, file)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    print(f"🧹 Removed old DB: {path}")
+            except Exception:
+                pass
 
-#     # Step 2: Create unique local path
-#     unique_suffix = str(uuid.uuid4())[:8]
-#     local_path = os.path.join(
-#         tempfile.gettempdir(), f"{os.path.basename(s3_key).split('.')[0]}_{unique_suffix}.db"
-#     )
 
-#     # Step 3: Download with retry
-#     for attempt in range(3):
-#         try:
-#             if os.path.exists(local_path):
-#                 os.remove(local_path)
+# Run cleanup on each run (since Streamlit doesn't exit normally)
+cleanup_old_dbs()
 
-#             s3.download_file(BUCKET_NAME, s3_key, local_path)
+# ------------------------
+# Helper: Verify S3 file exists
+# ------------------------
+def verify_s3_file(bucket, key):
+    """Check if file exists in S3 and return size."""
+    try:
+        response = s3.head_object(Bucket=bucket, Key=key)
+        size_mb = response["ContentLength"] / (1024 * 1024)
+        return size_mb
+    except ClientError as e:
+        raise FileNotFoundError(f"File not found or no permission: {key}\n{e}")
+# ------------------------
+# Load SQLite safely from S3
+# ------------------------
+def load_sqlite_from_s3(s3_key: str):
+    """Download SQLite DB safely from S3, ensuring full and valid file."""
+    base_name = os.path.basename(s3_key).replace("/", "_")
+    local_path = os.path.join(tempfile.gettempdir(), base_name)
 
-#             # Validate file
-#             if os.path.getsize(local_path) < 1024:
-#                 raise ValueError("File too small — possibly incomplete")
+    # ✅ Reuse cached DB if it already exists
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
+        print(f"✅ Using cached DB: {local_path}")
+        return local_path
 
-#             conn = sqlite3.connect(local_path)
-#             tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-#             conn.close()
+    print(f"⬇️ Downloading {s3_key} from S3...")
+    s3.download_file(BUCKET_NAME, s3_key, local_path)
 
-#             if tables.empty:
-#                 raise ValueError("No tables found — possibly corrupted")
+    # Validate DB file
+    if os.path.getsize(local_path) < 1024:
+        raise ValueError(f"Downloaded DB too small — possibly incomplete: {local_path}")
 
-#             # Delete temp DB on exit
-#             atexit.register(lambda: os.path.exists(local_path) and os.remove(local_path))
-#             return local_path
+    conn = sqlite3.connect(local_path)
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+    conn.close()
 
-#         except Exception:
-#             time.sleep(2)
+    if tables.empty:
+        raise ValueError(f"No tables found in downloaded DB: {local_path}")
 
-#     raise RuntimeError(f"Failed to download and verify {s3_key} after multiple attempts.")
+    # Delete on exit (in case Streamlit is stopped)
+    atexit.register(lambda: os.path.exists(local_path) and os.remove(local_path))
 
-# # ------------------------
-# # Safe DB connection + table detection
-# # ------------------------
-# def get_first_table_name(conn):
-#     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-#     if tables.empty:
-#         raise ValueError("No tables found in the database.")
-#     return tables.iloc[0, 0]
+    print(f"✅ DB ready at {local_path}")
+    return local_path
 
-# def load_table_dynamic(db_path, expected_table_name=None):
-#     """Loads the table by expected name or auto-detects if not found."""
-#     try:
-#         conn = sqlite3.connect(db_path, timeout=10)
-#         tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-#         available = tables["name"].tolist()
+# ------------------------
+# Safe table loader
+# ------------------------
+def load_table_dynamic(db_path, expected_table_name=None):
+    """Loads table by expected name or auto-detects if not found."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+        available = tables["name"].tolist()
 
-#         # Pick best match (case-insensitive)
-#         if expected_table_name:
-#             match = next((t for t in available if t.lower() == expected_table_name.lower()), None)
-#         else:
-#             match = None
+        if expected_table_name:
+            match = next((t for t in available if t.lower() == expected_table_name.lower()), None)
+        else:
+            match = available[0] if available else None
 
-#         if not match:
-#             match = get_first_table_name(conn)
+        if not match:
+            raise ValueError("No matching table found in DB")
 
-#         df = pd.read_sql(f'SELECT * FROM "{match}"', conn)
-#         conn.close()
-#         return df
+        df = pd.read_sql(f'SELECT * FROM "{match}"', conn)
+        conn.close()
+        print(f"📄 Loaded {len(df)} rows from {match}")
+        return df
 
-#     except Exception as e:
-#         print(f"❌ Failed to load from {db_path}: {e}")
-#         return pd.DataFrame()
+    except Exception as e:
+        print(f"❌ Failed to load from {db_path}: {e}")
+        return pd.DataFrame()
 
-# # ------------------------
-# # Download both DBs silently
-# # ------------------------
-# try:
-#     DB_PATH_ITEMS = load_sqlite_from_s3(S3_KEYS["items"])
-#     DB_PATH_USERS = load_sqlite_from_s3(S3_KEYS["users"])
-# except Exception as e:
-#     print(f"❌ Failed to load databases: {e}")
-#     DB_PATH_ITEMS = DB_PATH_USERS = None
+# ------------------------
+# Cache DB load (avoid re-downloads)
+# ------------------------
+@st.cache_resource(show_spinner=False)
+def get_db_paths():
+    items = load_sqlite_from_s3(S3_KEYS["items"])
+    users = load_sqlite_from_s3(S3_KEYS["users"])
+    return items, users
 
-# # ------------------------
-# # Load both datasets
-# # ------------------------
-# df_items = load_table_dynamic(DB_PATH_ITEMS, "inspection_employee_schedule_items")
-# df_users = load_table_dynamic(DB_PATH_USERS, "inspection_employee_schedule_users")
+# ------------------------
+# Load both datasets
+# ------------------------
+try:
+    DB_PATH_ITEMS, DB_PATH_USERS = get_db_paths()
+    df_items = load_table_dynamic(DB_PATH_ITEMS, "inspection_employee_schedule_items")
+    df_users = load_table_dynamic(DB_PATH_USERS, "inspection_employee_schedule_users")
+except Exception as e:
+    st.error(f"❌ Failed to load databases: {e}")
+    df_items, df_users = pd.DataFrame(), pd.DataFrame()
 
 # ------------------------
 # Utility: Get single table name from SQLite DB
@@ -484,42 +479,73 @@ Task: respond ONLY with RELATED or UNRELATED depending on whether the user's que
 
 
 # ------------------------
-# Generate Analytical Report
+# Generate Analytical Report (Enhanced)
 # ------------------------
-def generate_report_with_insights(summary, question, llm_model, relevance):
+def generate_report_with_insights(summary, question, llm_model, relevance, df=None):
+    """Generate an analytical report with contextual KPIs, anomalies, and recommendations."""
+    # ✅ Fallback if no LLM (offline mode)
     if llm_model is None:
-        # simple fallback textual report
         if relevance:
-            return f"(No LLM available) The filtered data summary:\n{summary}\nQuestion: {question}"
+            return f"(No LLM active) Analytical Summary:\n{summary}\n\nQuestion: {question}"
         else:
-            return f"(No LLM available) Your question doesn't look related to the filtered data. Summary of filtered data:\n{summary}"
+            return f"(No LLM active) Your question seems unrelated to filtered data. Summary:\n{summary}"
 
-    ctx = (
-        "The user's question is related to the filtered dataset."
-        if relevance
-        else "The question seems unrelated; provide a short summary of the filtered data instead."
-    )
+    # ✅ Construct KPI snapshot if DataFrame available
+    kpi_text = ""
+    if df is not None and not df.empty:
+        try:
+            total_rows = len(df)
+            region_count = df["region"].nunique() if "region" in df.columns else 0
+            top_template = df["TemplateNames"].value_counts().idxmax() if "TemplateNames" in df.columns else "N/A"
+            top_employee = df["owner name"].value_counts().idxmax() if "owner name" in df.columns else "N/A"
 
+            kpi_text = f"""
+            Total Records: {total_rows}
+            Unique Regions: {region_count}
+            Top Template: {top_template}
+            Top Employee: {top_employee}
+            """
+        except Exception:
+            pass
+
+    # ✅ Descriptive, structured, analytical prompt
     prompt = f"""
-You are a senior data analyst.
+You are a **senior data analyst** with expertise in operational insights and KPI storytelling.
 
-{ctx}
+You are given a dataset summary and, if applicable, filtered visualization data.
 
-Filtered data summary:
+---
+
+### Summary Statistics:
 {summary}
 
-User question:
+### Key Performance Indicators (KPIs):
+{kpi_text}
+
+---
+
+### User's Question:
 {question}
 
-Requirements:
-- If related -> answer using the filtered data and highlight top/bottom performers, anomalies, and 2 actionable recommendations.
-- If unrelated -> politely state it's unrelated and provide a concise summary of the filtered data.
-Keep it professional and concise.
+### Task:
+1. Answer the question **clearly and accurately** using the dataset summary.
+2. Compute or describe key metrics such as **total inspections**, **percentage share of top templates**, and **employee contribution**.
+3. Highlight **top and bottom performing**:
+   - Regions
+   - Templates
+   - Responses (if present)
+   - Assignee status or employees
+4. Identify **patterns, trends, or anomalies**.
+5. Provide **two actionable recommendations** for improvement or optimization.
+6. If possible, compare **selected month vs. previous month** trends or deviations.
+7. Use a professional tone suitable for management reporting.
+8. Format your response using bullet points, bold KPIs, and clear section headers.
+
+Return the final analytical response in a clean markdown format.
 """
 
     try:
         response = llm_model.invoke(prompt)
-        # ✅ Extract text properly (handles both LangChain and dict outputs)
         if hasattr(response, "content"):
             return response.content
         elif isinstance(response, dict) and "content" in response:
@@ -600,39 +626,89 @@ col_left, col_right = st.columns([1, 0.6])
 with col_left:
     st.subheader("💬 Ask a Question About the Data")
     user_question = st.text_input("Enter your question:")
-
+    
     if st.button("Ask Chatbot"):
         if not user_question.strip():
             st.warning("Please enter a question.")
         else:
             try:
-                # ✅ CASE 1: filtered_df available
+                # --- CASE 1: Filtered dataset ---
                 if "filtered_df" in st.session_state and not st.session_state["filtered_df"].empty:
                     df = st.session_state["filtered_df"]
-                    st.info("🔎 Analyzing filtered dataset...")
-
+                    st.info("🔎 Analyzing **filtered dataset**...")
+    
                     summary = generate_dataframe_summary(df)
                     relevance = detect_query_relevance(llm, df, user_question)
-
+    
+                    # ✅ KPI snapshot
+                    try:
+                        total_records = len(df)
+                        unique_regions = df["region"].nunique() if "region" in df.columns else 0
+                        top_template = df["TemplateNames"].value_counts().idxmax() if "TemplateNames" in df.columns else "N/A"
+                        top_employee = df["owner name"].value_counts().idxmax() if "owner name" in df.columns else "N/A"
+                    except Exception:
+                        total_records, unique_regions, top_template, top_employee = 0, 0, "N/A", "N/A"
+    
+                    # --- KPI Display Section ---
+                    st.markdown("### 📊 Key Metrics")
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Total Records", total_records)
+                    col2.metric("Unique Regions", unique_regions)
+                    col3.metric("Top Template", top_template)
+                    col4.metric("Top Employee", top_employee)
+                    style_metric_cards(background_color="#f8f9fa", border_color="#e0e0e0", border_radius_px=12)
+    
+                    # --- Report Generation ---
                     if relevance:
-                        st.success("🧠 Query detected as related to filtered data.")
+                        st.success("🧠 Query detected as relevant to filtered data.")
                     else:
                         st.warning("⚠️ Query seems unrelated — summarizing filtered data context.")
-
-                    answer = generate_report_with_insights(summary, user_question, llm, relevance)
-                    st.markdown("### 📋 Chatbot Response")
-                    st.write(answer)
-                    
+    
+                    answer = generate_report_with_insights(summary, user_question, llm, relevance, df)
+    
+                    st.markdown("---")
+                    st.markdown("### 📝 Analytical Report")
+                    st.markdown(answer)
+    
+                    # --- Auto Visuals ---
                     if relevance:
                         auto_generate_visuals(df, user_question)
-
-                # ✅ CASE 2: No filtered data → SQL + RAG hybrid
+    
+                # --- CASE 2: No filters (full dataset) ---
                 else:
-                    st.info("📚 Querying full dataset via hybrid SQL + RAG...")
-                    final_answer = get_chatbot_response(user_question, sql_agent, rag_chain)
-                    st.markdown("### 📋 Chatbot Response (Full Database)")
-                    st.write(final_answer)
-
+                    st.info("📚 No filters applied — analyzing **full items dataset**...")
+                    df = df_items.copy()
+    
+                    summary = generate_dataframe_summary(df)
+                    relevance = True  # Always relevant in full analysis
+    
+                    # ✅ KPI snapshot
+                    try:
+                        total_records = len(df)
+                        unique_regions = df["region"].nunique() if "region" in df.columns else 0
+                        top_template = df["TemplateNames"].value_counts().idxmax() if "TemplateNames" in df.columns else "N/A"
+                        top_employee = df["owner name"].value_counts().idxmax() if "owner name" in df.columns else "N/A"
+                    except Exception:
+                        total_records, unique_regions, top_template, top_employee = 0, 0, "N/A", "N/A"
+    
+                    # --- KPI Display ---
+                    st.markdown("### 📊 Key Metrics")
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Total Records", total_records)
+                    col2.metric("Unique Regions", unique_regions)
+                    col3.metric("Top Template", top_template)
+                    col4.metric("Top Employee", top_employee)
+                    style_metric_cards(background_color="#f8f9fa", border_color="#e0e0e0", border_radius_px=12)
+    
+                    # --- Report ---
+                    answer = generate_report_with_insights(summary, user_question, llm, relevance, df)
+    
+                    st.markdown("---")
+                    st.markdown("### 📝 Analytical Report (Full Dataset)")
+                    st.markdown(answer)
+    
+                    auto_generate_visuals(df, user_question)
+    
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
