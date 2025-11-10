@@ -64,121 +64,131 @@ S3_KEYS = {
 
 s3 = boto3.client("s3")
 
-# ------------------------
-# Helper: Clean old temp DB files (>24 hours)
-# ------------------------
-def cleanup_old_dbs(tmp_dir=tempfile.gettempdir(), hours=24):
-    cutoff = time.time() - hours * 1800
-    for file in os.listdir(tmp_dir):
-        if file.endswith(".db"):
-            path = os.path.join(tmp_dir, file)
-            try:
-                if os.path.getmtime(path) < cutoff:
-                    os.remove(path)
-            except Exception:
-                pass
-# ------------------------
-# Helper: Verify S3 object
-# ------------------------
-def verify_s3_file(bucket, key):
-    """Check if the file exists in S3 and return size."""
-    try:
-        response = s3.head_object(Bucket=bucket, Key=key)
-        size_mb = response["ContentLength"] / (1024 * 1024)
-        return size_mb
-    except ClientError as e:
-        raise FileNotFoundError(f"File not found or no permission: {key}\n{e}")
-# ------------------------
-# Load SQLite safely from S3 (silent version)
-# ------------------------
-def load_sqlite_from_s3(s3_key: str):
-    """Download SQLite DB safely from S3, ensuring complete file before use."""
-    # Step 1: Verify S3 file
-    head = s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)
-    size_mb = head["ContentLength"] / (1024 * 1024)
+def download_db_from_s3(s3_key):
+    # Create a truly unique temp file
+    tmp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    local_path = tmp_file.name
+    tmp_file.close()  # close it so Windows releases the lock
+    s3.download_file(BUCKET_NAME, s3_key, local_path)
+    return local_path
+    
+DB_PATH_ITEMS = download_db_from_s3(S3_KEYS["items"])
+DB_PATH_USERS = download_db_from_s3(S3_KEYS["users"])
+# # ------------------------
+# # Helper: Clean old temp DB files (>24 hours)
+# # ------------------------
+# def cleanup_old_dbs(tmp_dir=tempfile.gettempdir(), hours=24):
+#     cutoff = time.time() - hours * 1800
+#     for file in os.listdir(tmp_dir):
+#         if file.endswith(".db"):
+#             path = os.path.join(tmp_dir, file)
+#             try:
+#                 if os.path.getmtime(path) < cutoff:
+#                     os.remove(path)
+#             except Exception:
+#                 pass
+# # ------------------------
+# # Helper: Verify S3 object
+# # ------------------------
+# def verify_s3_file(bucket, key):
+#     """Check if the file exists in S3 and return size."""
+#     try:
+#         response = s3.head_object(Bucket=bucket, Key=key)
+#         size_mb = response["ContentLength"] / (1024 * 1024)
+#         return size_mb
+#     except ClientError as e:
+#         raise FileNotFoundError(f"File not found or no permission: {key}\n{e}")
+# # ------------------------
+# # Load SQLite safely from S3 (silent version)
+# # ------------------------
+# def load_sqlite_from_s3(s3_key: str):
+#     """Download SQLite DB safely from S3, ensuring complete file before use."""
+#     # Step 1: Verify S3 file
+#     head = s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+#     size_mb = head["ContentLength"] / (1024 * 1024)
 
-    # Step 2: Create unique local path
-    unique_suffix = str(uuid.uuid4())[:8]
-    local_path = os.path.join(
-        tempfile.gettempdir(), f"{os.path.basename(s3_key).split('.')[0]}_{unique_suffix}.db"
-    )
+#     # Step 2: Create unique local path
+#     unique_suffix = str(uuid.uuid4())[:8]
+#     local_path = os.path.join(
+#         tempfile.gettempdir(), f"{os.path.basename(s3_key).split('.')[0]}_{unique_suffix}.db"
+#     )
 
-    # Step 3: Download with retry
-    for attempt in range(3):
-        try:
-            if os.path.exists(local_path):
-                os.remove(local_path)
+#     # Step 3: Download with retry
+#     for attempt in range(3):
+#         try:
+#             if os.path.exists(local_path):
+#                 os.remove(local_path)
 
-            s3.download_file(BUCKET_NAME, s3_key, local_path)
+#             s3.download_file(BUCKET_NAME, s3_key, local_path)
 
-            # Validate file
-            if os.path.getsize(local_path) < 1024:
-                raise ValueError("File too small — possibly incomplete")
+#             # Validate file
+#             if os.path.getsize(local_path) < 1024:
+#                 raise ValueError("File too small — possibly incomplete")
 
-            conn = sqlite3.connect(local_path)
-            tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-            conn.close()
+#             conn = sqlite3.connect(local_path)
+#             tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+#             conn.close()
 
-            if tables.empty:
-                raise ValueError("No tables found — possibly corrupted")
+#             if tables.empty:
+#                 raise ValueError("No tables found — possibly corrupted")
 
-            # Delete temp DB on exit
-            atexit.register(lambda: os.path.exists(local_path) and os.remove(local_path))
-            return local_path
+#             # Delete temp DB on exit
+#             atexit.register(lambda: os.path.exists(local_path) and os.remove(local_path))
+#             return local_path
 
-        except Exception:
-            time.sleep(2)
+#         except Exception:
+#             time.sleep(2)
 
-    raise RuntimeError(f"Failed to download and verify {s3_key} after multiple attempts.")
+#     raise RuntimeError(f"Failed to download and verify {s3_key} after multiple attempts.")
 
-# ------------------------
-# Safe DB connection + table detection
-# ------------------------
-def get_first_table_name(conn):
-    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-    if tables.empty:
-        raise ValueError("No tables found in the database.")
-    return tables.iloc[0, 0]
+# # ------------------------
+# # Safe DB connection + table detection
+# # ------------------------
+# def get_first_table_name(conn):
+#     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+#     if tables.empty:
+#         raise ValueError("No tables found in the database.")
+#     return tables.iloc[0, 0]
 
-def load_table_dynamic(db_path, expected_table_name=None):
-    """Loads the table by expected name or auto-detects if not found."""
-    try:
-        conn = sqlite3.connect(db_path, timeout=10)
-        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-        available = tables["name"].tolist()
+# def load_table_dynamic(db_path, expected_table_name=None):
+#     """Loads the table by expected name or auto-detects if not found."""
+#     try:
+#         conn = sqlite3.connect(db_path, timeout=10)
+#         tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+#         available = tables["name"].tolist()
 
-        # Pick best match (case-insensitive)
-        if expected_table_name:
-            match = next((t for t in available if t.lower() == expected_table_name.lower()), None)
-        else:
-            match = None
+#         # Pick best match (case-insensitive)
+#         if expected_table_name:
+#             match = next((t for t in available if t.lower() == expected_table_name.lower()), None)
+#         else:
+#             match = None
 
-        if not match:
-            match = get_first_table_name(conn)
+#         if not match:
+#             match = get_first_table_name(conn)
 
-        df = pd.read_sql(f'SELECT * FROM "{match}"', conn)
-        conn.close()
-        return df
+#         df = pd.read_sql(f'SELECT * FROM "{match}"', conn)
+#         conn.close()
+#         return df
 
-    except Exception as e:
-        print(f"❌ Failed to load from {db_path}: {e}")
-        return pd.DataFrame()
+#     except Exception as e:
+#         print(f"❌ Failed to load from {db_path}: {e}")
+#         return pd.DataFrame()
 
-# ------------------------
-# Download both DBs silently
-# ------------------------
-try:
-    DB_PATH_ITEMS = load_sqlite_from_s3(S3_KEYS["items"])
-    DB_PATH_USERS = load_sqlite_from_s3(S3_KEYS["users"])
-except Exception as e:
-    print(f"❌ Failed to load databases: {e}")
-    DB_PATH_ITEMS = DB_PATH_USERS = None
+# # ------------------------
+# # Download both DBs silently
+# # ------------------------
+# try:
+#     DB_PATH_ITEMS = load_sqlite_from_s3(S3_KEYS["items"])
+#     DB_PATH_USERS = load_sqlite_from_s3(S3_KEYS["users"])
+# except Exception as e:
+#     print(f"❌ Failed to load databases: {e}")
+#     DB_PATH_ITEMS = DB_PATH_USERS = None
 
-# ------------------------
-# Load both datasets
-# ------------------------
-df_items = load_table_dynamic(DB_PATH_ITEMS, "inspection_employee_schedule_items")
-df_users = load_table_dynamic(DB_PATH_USERS, "inspection_employee_schedule_users")
+# # ------------------------
+# # Load both datasets
+# # ------------------------
+# df_items = load_table_dynamic(DB_PATH_ITEMS, "inspection_employee_schedule_items")
+# df_users = load_table_dynamic(DB_PATH_USERS, "inspection_employee_schedule_users")
 
 # ------------------------
 # Utility: Get single table name from SQLite DB
